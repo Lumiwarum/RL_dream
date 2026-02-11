@@ -1,0 +1,23 @@
+defaults:
+  - config
+  - _self_
+
+exp_name: "quickstart"
+seed: 0
+
+env:
+  id: "InvertedPendulum-v5"
+  num_envs: 1
+
+training:
+  total_steps: 90000
+  steps_per_chunk: 10000
+  checkpoint_every_steps: 2000
+  log_every_steps: 500
+  log_episode_every: 5
+
+method:
+  name: "fixed_h20"
+  uncertainty_metric: "next_obs_mean_l2"
+  thresh_high: 0.20
+  thresh_mid: 0.08

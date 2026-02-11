@@ -1,0 +1,25 @@
+defaults:
+  - config
+  - _self_
+exp_name: "hopper_adaptive"
+seed: 0
+
+env:
+  id: "Hopper-v4"
+  num_envs: 1
+
+training:
+  total_steps: 1000000
+  steps_per_chunk: 200000
+  start_learning: 5000
+  checkpoint_every_steps: 10000
+  log_every_steps: 2000
+
+method:
+  name: "adaptive_5_10_20"
+  uncertainty_metric: "next_obs_mean_l2"
+  thresh_high: 0.30
+  thresh_mid: 0.12
+
+imagination:
+  horizons: [5, 10, 20]
