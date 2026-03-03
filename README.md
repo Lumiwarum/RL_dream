@@ -67,3 +67,11 @@ python eval.py --config quickstart \
 ```
 python eval_latest_video.py --config quickstart --run_dir runs/<exp_name> --episodes 5 --device cuda --video_dir runs/<exp_name>/videos_latest
 ```
+
+## Experiments
+
+1. python scripts/run_experiments.py --group main --dry_run   # preview
+2. python scripts/run_experiments.py --group main             # run ~24 experiments
+3. python scripts/run_experiments.py --group ablation_metric  # then ablations
+4. python scripts/collect_results.py                          # extract + plot
+5. open thesis/thesis_skeleton.tex and replace \RESULT{} markers

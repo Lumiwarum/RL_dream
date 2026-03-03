@@ -39,7 +39,10 @@ class Checkpointer:
                 "critic_opt": trainer.critic_opt.state_dict(),
             },
             "metrics": {
-                "best_eval_return": float(getattr(trainer, "best_eval_return", -1e9)),
+                "best_eval_return":  float(getattr(trainer, "best_eval_return",  -1e9)),
+                # FIX: persist best_train_return so train-based rollback doesn't reset
+                # to -1e9 on resume, which would cause spurious early rollbacks.
+                "best_train_return": float(getattr(trainer, "best_train_return", -1e9)),
             }
         }
         return ckpt
@@ -93,7 +96,9 @@ class Checkpointer:
         if restore_replay:
             trainer.replay.load_state_dict(ckpt["replay"])
 
-        trainer.best_eval_return = float(ckpt["metrics"]["best_eval_return"])
+        trainer.best_eval_return  = float(ckpt["metrics"]["best_eval_return"])
+        # FIX: restore best_train_return; use .get() to stay compatible with old checkpoints
+        trainer.best_train_return = float(ckpt["metrics"].get("best_train_return", -1e9))
 
         if restore_step:  # Only restore RNG on full restore (not rollback)
             restore_rng_state(ckpt["rng"])

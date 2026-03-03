@@ -422,23 +422,15 @@ class Trainer:
 
         self.wm_opt.zero_grad(set_to_none=True)
         
-        def kl_balanced(q: DiagGaussian, p: DiagGaussian) -> torch.Tensor:
-            """
-            Docstring for kl_balanced
-            
-            :param q: Description
-            :type q: DiagGaussian
-            :param p: Description
-            :type p: DiagGaussian
-            :return: Description
-            :rtype: Tensor
-            """
-            q_sg = DiagGaussian(q.mean.detach(), q.log_std.detach())
-            p_sg = DiagGaussian(p.mean.detach(), p.log_std.detach())
-            kl_lhs = q_sg.kl_div(p)
-            kl_rhs = q.kl_div(p_sg)
-            kl = kl_balance * kl_lhs + (1.0 - kl_balance) * kl_rhs
-            return kl
+        def _kl_per_dim(d1: DiagGaussian, d2: DiagGaussian) -> torch.Tensor:
+            """KL(d1 || d2) per latent dimension — returns [B, latent_dim]."""
+            s1 = torch.exp(d1.log_std)
+            s2 = torch.exp(d2.log_std)
+            return (
+                d2.log_std - d1.log_std
+                + (s1.pow(2) + (d1.mean - d2.mean).pow(2)) / (2.0 * s2.pow(2) + 1e-8)
+                - 0.5
+            )
 
         for wm in self.world_model_ensemble.models:
             states, post_dists, prior_dists = wm.rssm.observe_sequence(obs, actions, device=self.device, sample=True)
@@ -466,15 +458,25 @@ class Trainer:
             )
 
 
-            # KL across time, mean over batch/time
+            # KL across time, mean over batch/time.
+            # FIX: free bits applied per-dimension before summing (DreamerV3 Appendix B).
+            # Old code clamped the already-summed [B] scalar, giving a free floor of only
+            # 1.0 nat total for all 64 dimensions (~0.016 nats/dim). Correct behaviour
+            # clamps each dimension independently so each gets up to free_nats nats free.
             kls = []
             for t in range(len(post_dists)):
                 q = post_dists[t]
                 p = prior_dists[t]
                 qg = DiagGaussian(q.mean, q.log_std)
                 pg = DiagGaussian(p.mean, p.log_std)
-                kl_t = kl_balanced(qg, pg)
-                kl_t = torch.clamp(kl_t, min=free_nats)
+                q_sg = DiagGaussian(qg.mean.detach(), qg.log_std.detach())
+                p_sg = DiagGaussian(pg.mean.detach(), pg.log_std.detach())
+                # Per-dim balanced KL: route gradients through each side independently
+                kl_lhs_per_dim = _kl_per_dim(q_sg, pg)   # [B, D] — grad into prior p
+                kl_rhs_per_dim = _kl_per_dim(qg,   p_sg)  # [B, D] — grad into posterior q
+                kl_per_dim = kl_balance * kl_lhs_per_dim + (1.0 - kl_balance) * kl_rhs_per_dim
+                # Free bits: clamp each dimension, then sum over latent dims → [B]
+                kl_t = torch.clamp(kl_per_dim, min=free_nats).sum(dim=-1)
                 kls.append(kl_t)
             kl = torch.stack(kls, dim=1).mean()
 

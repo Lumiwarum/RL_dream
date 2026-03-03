@@ -48,14 +48,21 @@ class DiagGaussian:
 
     def kl_div(self, other: "DiagGaussian") -> torch.Tensor:
         """
-        KL(self || other) for diagonal Gaussians.
+        KL(self || other) for diagonal Gaussians, summed over the latent dimension.
         Returns shape [batch].
+
+        KL(N(m1,s1) || N(m2,s2)) = sum_i [ log(s2_i/s1_i)
+                                            + (s1_i^2 + (m1_i - m2_i)^2) / (2 s2_i^2)
+                                            - 1/2 ]
+
+        FIX: previous code computed log(s2/(s1+eps) + eps) which is numerically
+        inconsistent (double epsilon distorts the ratio when s1 is small).
+        Using log_std directly — log(s2/s1) = log_std_other - log_std_self — is
+        exact and avoids any epsilon artefact since log_std is already stored.
         """
-        # KL between N(m1,s1) and N(m2,s2):
-        # log(s2/s1) + (s1^2 + (m1-m2)^2) / (2 s2^2) - 1/2
-        s1 = torch.exp(self.log_std)
-        s2 = torch.exp(other.log_std)
-        term1 = torch.log(s2 / (s1 + 1e-8) + 1e-8)
-        term2 = (s1.pow(2) + (self.mean - other.mean).pow(2)) / (2.0 * s2.pow(2) + 1e-8)
+        s1_sq = torch.exp(2.0 * self.log_std)   # s1^2, numerically stable
+        s2_sq = torch.exp(2.0 * other.log_std)
+        term1 = other.log_std - self.log_std                                   # log(s2/s1)
+        term2 = (s1_sq + (self.mean - other.mean).pow(2)) / (2.0 * s2_sq + 1e-8)
         kl = (term1 + term2 - 0.5).sum(dim=-1)
         return kl
