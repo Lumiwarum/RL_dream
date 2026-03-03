@@ -93,7 +93,7 @@ def _hydra_entrypoint(config_name: str):
         cfg.env.id = str(ckpt["cfg"]["env"]["id"])
 
         trainer = Trainer(cfg, build_env=False)
-        trainer.checkpointer.load_into(trainer, ckpt, device=device)
+        trainer.checkpointer.load_into(trainer, ckpt)
 
         actor = trainer.agent.actor.to(device)
         actor.eval()

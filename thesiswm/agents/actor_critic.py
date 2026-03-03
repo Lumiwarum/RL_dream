@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +28,7 @@ class TanhGaussianPolicy(nn.Module):
         log_std = torch.clamp(log_std, -5.0, 2.0)
         return mean, log_std
 
-    def sample(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, x: torch.Tensor):
         mean, log_std = self.forward(x)
         std = torch.exp(log_std)
         eps = torch.randn_like(std)
@@ -34,9 +36,16 @@ class TanhGaussianPolicy(nn.Module):
         action = torch.tanh(pre_tanh)
 
         # log_prob with tanh correction
-        # log N(pre_tanh; mean, std) - sum log(1 - tanh^2 + eps)
-        log_prob = -0.5 * (((pre_tanh - mean) / (std + 1e-8)) ** 2 + 2 * log_std + torch.log(torch.tensor(2.0 * 3.14159265, device=x.device))).sum(dim=-1)
-        log_prob = log_prob - torch.log(1.0 - action.pow(2) + 1e-6).sum(dim=-1)
+        # Use math.pi for precision and clamp action to prevent boundary issues
+        action_clamped = action.clamp(-0.999999, 0.999999)  # Safe boundary
+
+        log_prob = -0.5 * (
+            ((pre_tanh - mean) / (std + 1e-8)) ** 2 
+            + 2 * log_std 
+            + torch.log(torch.tensor(2.0 * math.pi, device=x.device, dtype=std.dtype))
+        ).sum(dim=-1)
+
+        log_prob = log_prob - torch.log(1.0 - action_clamped.pow(2)).sum(dim=-1)
         return action, log_prob
 
     def mean_action(self, x: torch.Tensor) -> torch.Tensor:

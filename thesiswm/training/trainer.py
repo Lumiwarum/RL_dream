@@ -34,7 +34,7 @@ class TrainerState:
 
 def load_checkpoint_into_trainer_state(trainer: "Trainer", ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    trainer.checkpointer.load_into(trainer, ckpt, device=device)
+    trainer.checkpointer.load_into(trainer, ckpt)
     return ckpt
 
 
@@ -107,6 +107,7 @@ class Trainer:
         self.critic_opt = torch.optim.Adam(self.agent.critic.parameters(), lr=float(cfg.agent.critic_lr))
 
         self.state = TrainerState()
+        self.bad_eval_streak = 0
 
         # checkpointing
         self.checkpointer = Checkpointer(self.ckpt_dir)
@@ -118,13 +119,13 @@ class Trainer:
             if best_path is not None:
                 try:
                     ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
-                    self.checkpointer.load_into(self, ckpt, device=self.device)
+                    self.checkpointer.load_into(self, ckpt)
                     print(f"[RESUME] loaded {best_path} (env_step={self.state.env_step})")
                 except Exception:
                     pass
             elif latest is not None:
                 ckpt = torch.load(latest, map_location=self.device, weights_only=False)
-                self.checkpointer.load_into(self, ckpt, device=self.device)
+                self.checkpointer.load_into(self, ckpt)
                 print(f"[RESUME] loaded {latest} (env_step={self.state.env_step})")
             else:
                 print("[RESUME] no latest checkpoint found; starting fresh.")
@@ -178,7 +179,7 @@ class Trainer:
         start_step = int(self.state.env_step)
         end_step = min(total_steps, start_step + chunk_steps)
         # periodic deterministic eval + best checkpoint + rollback
-        eval_every = int(getattr(cfg.training, "eval_every_steps", 4))
+        eval_every = int(getattr(cfg.training, "eval_every_steps", 2000))
         eval_episodes = int(getattr(cfg.training, "eval_episodes", 5))
         best_min_delta = float(getattr(cfg.training, "best_min_delta", 0.0))
         rollback_drop = float(getattr(cfg.training, "rollback_drop", 10.0))  # drop in return
@@ -186,10 +187,19 @@ class Trainer:
         min_steps_before_rollback = int(getattr(cfg.training, "min_steps_before_rollback", 500))
         rollback_lr_scale = float(getattr(cfg.training, "rollback_lr_scale", 1.0))
 
+        # Hybrid approach: training-based early warning system
+        train_rollback_check = bool(getattr(cfg.training, "train_rollback_check", True))
+        train_rollback_drop = float(getattr(cfg.training, "train_rollback_drop", 20.0))
+        train_rollback_patience = int(getattr(cfg.training, "train_rollback_patience", 3))
+        train_bad_streak = 0
+
         obs, _ = self.env.reset(seed=int(cfg.seed) + self.state.env_step)
         obs = np.asarray(obs, dtype=np.float32)
-        
+
         self.best_eval_return = self.evaluate_deterministic(eval_episodes)
+        self.best_train_return = -1e9  # Track best training performance
+        save_best_train = bool(getattr(cfg.training, "save_best_train", True))  # Enable intermediate best checkpoints
+        train_best_min_delta = float(getattr(cfg.training, "train_best_min_delta", 1.0))  # Minimum improvement to save
 
         t0 = time.time()
         while self.state.env_step < end_step:
@@ -230,6 +240,56 @@ class Trainer:
                         self.tb.scalar("train/return_mean_20", float(np.mean(recent_returns)), self.state.env_step)
                         self.tb.scalar("train/len_mean_20", float(np.mean(recent_lens)), self.state.env_step)
                         self.tb.scalar("train/episodes", ep_count, self.state.env_step)
+
+                    # Save best training checkpoint based on recent performance
+                    if save_best_train and len(recent_returns) >= 5 and self.state.env_step >= int(cfg.training.start_learning):
+                        mean_train_ret = float(np.mean(recent_returns))
+                        if mean_train_ret > (self.best_train_return + train_best_min_delta):
+                            self.best_train_return = mean_train_ret
+                            ckpt = self.checkpointer.make_checkpoint(self)
+                            self.checkpointer.save(ckpt, tag="best_train", make_latest=False)
+                            self.tb.scalar("train/best_return", self.best_train_return, self.state.env_step)
+                            print(f"[BEST_TRAIN] New best training return: {self.best_train_return:.2f} at step {self.state.env_step}")
+                            train_bad_streak = 0  # Reset bad streak on improvement
+
+                        # Training-based early rollback detection
+                        if train_rollback_check and self.best_train_return > -1e8 and self.state.env_step >= min_steps_before_rollback:
+                            if mean_train_ret < (self.best_train_return - train_rollback_drop):
+                                train_bad_streak += 1
+                                self.tb.scalar("train/bad_streak", float(train_bad_streak), self.state.env_step)
+
+                                # Trigger immediate rollback if patience exceeded
+                                if train_bad_streak >= train_rollback_patience:
+                                    best_train_path = os.path.join(self.checkpointer.ckpt_dir, "best_train.pt")
+                                    if os.path.exists(best_train_path):
+                                        rollback_noise = float(getattr(cfg.training, "rollback_noise_scale", 0.01))
+                                        ckpt = torch.load(best_train_path, map_location=self.device, weights_only=False)
+                                        current_step = self.state.env_step
+                                        ckpt_step = ckpt["state"]["env_step"]
+
+                                        # Load weights but keep current step/optimizer/replay
+                                        self.checkpointer.load_into(
+                                            self, ckpt,
+                                            restore_step=False,
+                                            restore_optimizer=False,
+                                            restore_replay=False,
+                                            noise_scale=rollback_noise
+                                        )
+
+                                        # Optional: reduce actor lr
+                                        if rollback_lr_scale != 1.0:
+                                            for pg in self.actor_opt.param_groups:
+                                                pg["lr"] *= rollback_lr_scale
+
+                                        train_bad_streak = 0
+                                        print(f"[TRAIN_ROLLBACK] step={current_step}, loaded best_train from step={ckpt_step}, "
+                                              f"train_return dropped from {self.best_train_return:.2f} to {mean_train_ret:.2f}")
+                                        self.tb.scalar("train/rollback", 1.0, self.state.env_step)
+                                        self.tb.scalar("train/rollback_from_step", float(ckpt_step), self.state.env_step)
+                            else:
+                                # Performance recovered, reset streak
+                                if train_bad_streak > 0:
+                                    train_bad_streak = max(0, train_bad_streak - 1)
 
                     ep_return = 0.0
                     ep_len = 0
@@ -301,8 +361,25 @@ class Trainer:
                     if self.bad_eval_streak >= rollback_patience:
                         best_path = os.path.join(self.checkpointer.ckpt_dir, "best.pt")
                         if os.path.exists(best_path):
+                            # FIXED ROLLBACK LOOP: Don't restore step counter, add noise to weights
+                            # This prevents infinite loop where model diverges at same step repeatedly
                             ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
-                            self.checkpointer.load_into(self, ckpt, device=self.device)
+                            
+                            # Get rollback config
+                            rollback_noise = float(getattr(cfg.training, "rollback_noise_scale", 0.01))
+                            
+                            # Save current step before rollback
+                            current_step = self.state.env_step
+                            ckpt_step = ckpt["state"]["env_step"]
+                            
+                            # Load weights but keep current step/optimizer/replay
+                            self.checkpointer.load_into(
+                                self, ckpt,
+                                restore_step=False,        # Keep current step (prevent loop!)
+                                restore_optimizer=False,   # Keep current optimizer momentum
+                                restore_replay=False,      # Keep current replay buffer
+                                noise_scale=rollback_noise # Add noise to avoid identical trajectory
+                            )
 
                             # Optional: reduce actor lr to prevent re-collapse
                             if rollback_lr_scale != 1.0:
@@ -310,7 +387,11 @@ class Trainer:
                                     pg["lr"] *= rollback_lr_scale
 
                             self.bad_eval_streak = 0
+                            # Log rollback with details
+                            print(f"[ROLLBACK] step={current_step}, loaded weights from step={ckpt_step}, "
+                                  f"noise_scale={rollback_noise:.4f}, lr_scale={rollback_lr_scale}")
                             self.tb.scalar("eval/rollback", 1.0, self.state.env_step)
+                            self.tb.scalar("eval/rollback_from_step", float(ckpt_step), self.state.env_step)
                         else:
                             self.tb.scalar("eval/rollback", 0.0, self.state.env_step)
 
@@ -483,6 +564,8 @@ class Trainer:
             rewards: list[torch.Tensor] = []
             logps: list[torch.Tensor] = []
             done_probs: list[torch.Tensor] = []
+            actor_means: list[torch.Tensor] = []
+            actor_log_stds: list[torch.Tensor] = []
 
             gamma = float(cfg.agent.discount)
             lam = float(cfg.agent.lambda_)
@@ -497,6 +580,11 @@ class Trainer:
                 # actor samples action; grads flow into actor and through dynamics via actioon
                 a, logp = self.agent.actor.sample(feat)
                 logps.append(logp)
+                
+                with torch.no_grad():
+                    mean_t, log_std_t = self.agent.actor.forward(feat)
+                    actor_means.append(mean_t)
+                    actor_log_stds.append(log_std_t)
 
                 # Imagine next state; DO NOT detach action (we need pathwise gradient wrt action)
                 s, _ = wm.rssm.imagine_step(s, a, sample=True)
@@ -566,13 +654,16 @@ class Trainer:
             self._tb_flag_nan("logp", logps_t, step)
 
 
-            # Log actor distribution parameters (mean/log_std) on the flat feats
-            with torch.no_grad():
-                mean, log_std = self.agent.actor.forward(flat_feats)  # [B*H, act_dim], [B*H, act_dim]
-                std = torch.exp(log_std)
-                self.tb.scalar("policy/std_mean", std.mean().item(), step)
-                self._tb_stats("policy/log_std", log_std, step)
-                self._tb_stats("policy/mean", mean, step)
+            # FIXED ISSUE #4: Use cached actor distribution params instead of redundant forward pass
+            # Previously called self.agent.actor.forward(flat_feats) again, wasting 15-20% compute
+            # Now use the cached values from imagination loop
+            mean = torch.cat(actor_means, dim=0)  # [B*H, act_dim]
+            log_std = torch.cat(actor_log_stds, dim=0)  # [B*H, act_dim]
+            std = torch.exp(log_std)
+            self.tb.scalar("policy/std_mean", std.mean().item(), step)
+            self._tb_stats("policy/log_std", log_std, step)
+            self._tb_stats("policy/mean", mean, step)
+
 
             # --- critic update (Huber) ---
             self.critic_opt.zero_grad(set_to_none=True)

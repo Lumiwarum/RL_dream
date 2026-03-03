@@ -30,7 +30,7 @@ def main():
     for _ in range(200):
         a = env.action_space.sample().astype(np.float32)
         nobs, r, d, tr, _ = env.step(a)
-        rb.add(obs, a, float(r), bool(d or tr), np.asarray(nobs, dtype=np.float32))
+        rb.add(obs, a, float(r), bool(d), bool(tr), np.asarray(nobs, dtype=np.float32))
         obs = np.asarray(nobs, dtype=np.float32)
         if d or tr:
             obs, _ = env.reset(seed=0)
@@ -44,7 +44,7 @@ def main():
     obs_t = torch.as_tensor(batch["obs"], dtype=torch.float32, device=device)
     act_t = torch.as_tensor(batch["actions"], dtype=torch.float32, device=device)
     wm0 = ens.models[0]
-    states, post, prior = wm0.rssm.observe_sequence(obs_t, act_t, device=device)
+    states, post, prior = wm0.rssm.observe_sequence(obs_t, act_t, device=device, True)
     feat0 = wm0.features(states[0])
     assert feat0.shape[-1] == (128 + 32)
 

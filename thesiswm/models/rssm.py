@@ -233,11 +233,25 @@ class EnsembleWorldModel(nn.Module):
             return d / float(self.n - 1)
 
         if metric == "gaussian_kl":
-            # For simplicity: symmetric KL for first two members (works best with n=2)
-            p = next_z_dists[0]
-            q = next_z_dists[1]
-            kl_pq = p.kl_div(q)
-            kl_qp = q.kl_div(p)
-            return 0.5 * (kl_pq + kl_qp)
+            if self.n == 2:
+                # Fast path for n=2
+                p = next_z_dists[0]
+                q = next_z_dists[1]
+                kl_pq = p.kl_div(q)
+                kl_qp = q.kl_div(p)
+                return 0.5 * (kl_pq + kl_qp)
+            else:
+                # Average all pairwise KLs for n > 2
+                total_kl = 0.0
+                count = 0
+                for i in range(self.n):
+                    for j in range(i + 1, self.n):
+                        p = next_z_dists[i]
+                        q = next_z_dists[j]
+                        kl_pq = p.kl_div(q)
+                        kl_qp = q.kl_div(p)
+                        total_kl += 0.5 * (kl_pq + kl_qp)
+                        count += 1
+                return total_kl / count
 
         raise ValueError(f"Unknown metric: {metric}")

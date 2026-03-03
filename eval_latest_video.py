@@ -49,7 +49,7 @@ def main():
     cfg.env.id = str(ckpt["cfg"]["env"]["id"])
 
     trainer = Trainer(cfg, build_env=False)
-    trainer.checkpointer.load_into(trainer, ckpt, device=torch.device(args.device))
+    trainer.checkpointer.load_into(trainer, ckpt)
     trainer.agent.eval()
     trainer.world_model_ensemble.eval()
 

@@ -50,9 +50,14 @@ def decide_horizon(
     """
     u = ensemble.disagreement(obs=obs, action=action, metric=metric, device=device)  # [B]
     m = u.mean()
-    h5, h10, h20 = horizons
-    if float(m) > float(thresh_high):
-        return h5, u
-    if float(m) > float(thresh_mid):
-        return h10, u
-    return h20, u
+    if len(horizons) == 1:
+        return horizons[0], u
+    elif len(horizons) == 3:
+        h_low, h_mid, h_high = horizons
+        if float(m) > float(thresh_high):
+            return h_low, u
+        if float(m) > float(thresh_mid):
+            return h_mid, u
+        return h_high, u
+    else:
+        raise ValueError(f"horizons must have 1 or 3 elements, got {len(horizons)}")

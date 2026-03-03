@@ -48,7 +48,7 @@ method:
 
 imagination:
   horizon_fixed: 20          # used for fixed baselines (e.g., fixed_h15)
-  horizons: [10]      # adaptive candidates
+  horizons: [5, 10, 20]      # adaptive candidates
   batch_horizon_decision: "per_batch"  # (kept simple) choose one horizon per training batch
   rollout_batch: 512
   gamma: 0.99
@@ -64,14 +64,27 @@ training:
   update_every: 4
   updates_per_step: 1
   log_every_steps: 200
-  eval_every_steps: 100
+  eval_every_steps: 2000
+  eval_episodes: 5
   checkpoint_every_steps: 5000
   log_episode_every: 10
+
+  # Best checkpoint tracking
   best_min_delta: 1.0
-  rollback_drop: 10.0
-  rollback_patience: 2
-  min_steps_before_rollback: 100
-  rollback_lr_scale: 1.0
+  save_best_train: true
+  train_best_min_delta: 1.0
+
+  # Eval-based rollback (checked every eval_every_steps)
+  rollback_drop: 25.0
+  rollback_patience: 4
+  min_steps_before_rollback: 400
+  rollback_lr_scale: 0.9
+  rollback_noise_scale: 0.01
+
+  # Training-based early rollback (checked every episode)
+  train_rollback_check: true
+  train_rollback_drop: 20.0
+  train_rollback_patience: 3
 
 eval:
   checkpoint_path: ""

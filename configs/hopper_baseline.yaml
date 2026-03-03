@@ -6,7 +6,7 @@ exp_name: "hopper_baseline"
 seed: 0
 
 env:
-  id: "Hopper-v4"
+  id: "Hopper-v5"
   num_envs: 1
 
 training:
