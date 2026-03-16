@@ -108,6 +108,13 @@ class Trainer:
 
         self.state = TrainerState()
         self.bad_eval_streak = 0
+        # EMA of return std used to normalize the actor loss scale across training.
+        # Prevents gradient magnitude from exploding 100x as the agent improves.
+        self._return_scale = 1.0
+
+        # AMP: bfloat16 autocast — same dynamic range as float32, no GradScaler needed.
+        # Enabled only on CUDA; silently off on CPU.
+        self.use_amp = (self.device.type == "cuda") and bool(getattr(cfg, "use_amp", False))
 
         # checkpointing
         self.checkpointer = Checkpointer(self.ckpt_dir)
@@ -192,6 +199,8 @@ class Trainer:
         train_rollback_drop = float(getattr(cfg.training, "train_rollback_drop", 20.0))
         train_rollback_patience = int(getattr(cfg.training, "train_rollback_patience", 3))
         train_bad_streak = 0
+
+        _save_periodic = bool(getattr(cfg.training, "save_periodic_checkpoints", False))
 
         obs, _ = self.env.reset(seed=int(cfg.seed) + self.state.env_step)
         obs = np.asarray(obs, dtype=np.float32)
@@ -331,8 +340,9 @@ class Trainer:
                         self.tb.scalar("imagination/horizon_used", horizon_used, self.state.env_step)
                         self.tb.scalar("imagination/uncertainty_mean", unc_mean, self.state.env_step)
 
-            # checkpoint
-            if self.state.env_step % int(cfg.training.checkpoint_every_steps) == 0:
+            # checkpoint (periodic step saves disabled by default — only best.pt + end-of-chunk)
+            if (_save_periodic
+                    and self.state.env_step % int(cfg.training.checkpoint_every_steps) == 0):
                 self.save_checkpoint(tag=f"step_{self.state.env_step}")
 
             if eval_every > 0 and (self.state.env_step % eval_every == 0) and (self.state.env_step >= int(cfg.training.start_learning)):
@@ -413,6 +423,7 @@ class Trainer:
         rewards = torch.as_tensor(batch["rewards"], dtype=torch.float32, device=self.device)      # [B,T]
         next_obs = torch.as_tensor(batch["next_obs"], dtype=torch.float32, device=self.device)   # [B,T,obs_dim]
         terminated = torch.as_tensor(batch["terminated"], dtype=torch.float32, device=self.device)  # [B,T]
+        is_last    = torch.as_tensor(batch["is_last"],    dtype=torch.float32, device=self.device)  # [B,T] terminated OR truncated
 
         kl_beta = float(cfg.world_model.kl_beta)
         kl_balance = float(getattr(cfg.world_model, "kl_balance", 0.8))
@@ -432,55 +443,51 @@ class Trainer:
                 - 0.5
             )
 
+        _amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp)
         for wm in self.world_model_ensemble.models:
-            states, post_dists, prior_dists = wm.rssm.observe_sequence(obs, actions, device=self.device, sample=True)
+            with _amp_ctx:
+                states, post_dists, prior_dists = wm.rssm.observe_sequence(obs, actions, device=self.device, sample=True)
 
-            next_states = []
-            
-            for t, s_t in enumerate(states):
-                s_next, _ = wm.rssm.imagine_step(s_t, actions[:, t])
-                next_states.append(s_next)
-            next_feats = torch.stack([wm.features(s) for s in next_states], dim=1)
-            cont_logits = wm.predict_continue_logit(next_feats.reshape(-1, next_feats.shape[-1])).reshape(terminated.shape)
+                next_states = []
+                for t, s_t in enumerate(states):
+                    s_next, _ = wm.rssm.imagine_step(s_t, actions[:, t])
+                    next_states.append(s_next)
+                next_feats = torch.stack([wm.features(s) for s in next_states], dim=1)
+                flat_next = next_feats.reshape(-1, next_feats.shape[-1])
+                cont_logits = wm.predict_continue_logit(flat_next).reshape(terminated.shape)
 
-            # ---- IMPORTANT FIX: predict next_obs, not obs ----
-            obs_pred = wm.predict_obs(next_feats.reshape(-1, next_feats.shape[-1])).reshape(next_obs.shape)  # [B,T,obs_dim]
-            rew_pred = wm.predict_reward(next_feats.reshape(-1, next_feats.shape[-1])).reshape(rewards.shape)  # [B,T]
+                # ---- IMPORTANT FIX: predict next_obs, not obs ----
+                obs_pred = wm.predict_obs(flat_next).reshape(next_obs.shape)      # [B,T,obs_dim]
+                rew_pred = wm.predict_reward(flat_next).reshape(rewards.shape)    # [B,T]
 
-            obs_loss = F.mse_loss(obs_pred, next_obs)
-            rew_loss = F.mse_loss(rew_pred, rewards)
-            cont_target = 1.0 - terminated
-            pos = cont_target.mean().clamp_min(1e-6)
-            neg = (1.0 - cont_target).mean().clamp_min(1e-6)
-            pos_weight = torch.clamp((neg / pos).detach(), max=10.0)
-            done_loss = F.binary_cross_entropy_with_logits(
-                cont_logits, cont_target, pos_weight=pos_weight
-            )
+                obs_loss = F.mse_loss(obs_pred, next_obs)
+                rew_loss = F.mse_loss(rew_pred, rewards)
+                cont_target = 1.0 - is_last   # episode ended for ANY reason (fall OR timeout)
+                pos = cont_target.mean().clamp_min(1e-6)
+                neg = (1.0 - cont_target).mean().clamp_min(1e-6)
+                pos_weight = torch.clamp((neg / pos).detach(), max=10.0)
+                done_loss = F.binary_cross_entropy_with_logits(
+                    cont_logits, cont_target, pos_weight=pos_weight
+                )
 
+                # KL across time, mean over batch/time.
+                # FIX: free bits applied per-dimension before summing (DreamerV3 Appendix B).
+                kls = []
+                for t in range(len(post_dists)):
+                    q = post_dists[t]
+                    p = prior_dists[t]
+                    qg = DiagGaussian(q.mean, q.log_std)
+                    pg = DiagGaussian(p.mean, p.log_std)
+                    q_sg = DiagGaussian(qg.mean.detach(), qg.log_std.detach())
+                    p_sg = DiagGaussian(pg.mean.detach(), pg.log_std.detach())
+                    kl_lhs_per_dim = _kl_per_dim(q_sg, pg)
+                    kl_rhs_per_dim = _kl_per_dim(qg,   p_sg)
+                    kl_per_dim = kl_balance * kl_lhs_per_dim + (1.0 - kl_balance) * kl_rhs_per_dim
+                    kl_t = torch.clamp(kl_per_dim, min=free_nats).sum(dim=-1)
+                    kls.append(kl_t)
+                kl = torch.stack(kls, dim=1).mean()
 
-            # KL across time, mean over batch/time.
-            # FIX: free bits applied per-dimension before summing (DreamerV3 Appendix B).
-            # Old code clamped the already-summed [B] scalar, giving a free floor of only
-            # 1.0 nat total for all 64 dimensions (~0.016 nats/dim). Correct behaviour
-            # clamps each dimension independently so each gets up to free_nats nats free.
-            kls = []
-            for t in range(len(post_dists)):
-                q = post_dists[t]
-                p = prior_dists[t]
-                qg = DiagGaussian(q.mean, q.log_std)
-                pg = DiagGaussian(p.mean, p.log_std)
-                q_sg = DiagGaussian(qg.mean.detach(), qg.log_std.detach())
-                p_sg = DiagGaussian(pg.mean.detach(), pg.log_std.detach())
-                # Per-dim balanced KL: route gradients through each side independently
-                kl_lhs_per_dim = _kl_per_dim(q_sg, pg)   # [B, D] — grad into prior p
-                kl_rhs_per_dim = _kl_per_dim(qg,   p_sg)  # [B, D] — grad into posterior q
-                kl_per_dim = kl_balance * kl_lhs_per_dim + (1.0 - kl_balance) * kl_rhs_per_dim
-                # Free bits: clamp each dimension, then sum over latent dims → [B]
-                kl_t = torch.clamp(kl_per_dim, min=free_nats).sum(dim=-1)
-                kls.append(kl_t)
-            kl = torch.stack(kls, dim=1).mean()
-
-            loss = obs_loss + rew_loss + done_loss + kl_beta * kl
+                loss = obs_loss + rew_loss + done_loss + kl_beta * kl
             loss.backward()
 
             wm_losses.append(loss.detach().item())
@@ -558,86 +565,83 @@ class Trainer:
         try:
 
             # Infer starting latent state from the *context posterior* (not a 1-step state)
-            states, _, _ = wm.rssm.observe_sequence(obs_seq, act_seq, device=self.device, sample=False)
-            s = states[-1]
-
-
-            feats: list[torch.Tensor] = []
-            rewards: list[torch.Tensor] = []
-            logps: list[torch.Tensor] = []
-            done_probs: list[torch.Tensor] = []
-            actor_means: list[torch.Tensor] = []
-            actor_log_stds: list[torch.Tensor] = []
-
             gamma = float(cfg.agent.discount)
             lam = float(cfg.agent.lambda_)
 
+            _ac_amp = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp)
+            with _ac_amp:
+                states, _, _ = wm.rssm.observe_sequence(obs_seq, act_seq, device=self.device, sample=False)
+                s = states[-1]
 
-            # --- imagination rollout ---
-            for _ in range(H):
-                # IMPORTANT: no torch.no_grad() here; WM params are frozen, but we need grads wrt actions.
-                feat = wm.features(s) # [B, feat_dim]
-                feats.append(feat)
+                feats: list[torch.Tensor] = []
+                rewards: list[torch.Tensor] = []
+                logps: list[torch.Tensor] = []
+                done_probs: list[torch.Tensor] = []
+                actor_means: list[torch.Tensor] = []
+                actor_log_stds: list[torch.Tensor] = []
 
-                # actor samples action; grads flow into actor and through dynamics via actioon
-                a, logp = self.agent.actor.sample(feat)
-                logps.append(logp)
-                
+                # --- imagination rollout ---
+                for _ in range(H):
+                    # IMPORTANT: no torch.no_grad() here; WM params are frozen, but we need grads wrt actions.
+                    feat = wm.features(s)  # [B, feat_dim]
+                    feats.append(feat)
+
+                    # actor samples action; grads flow into actor and through dynamics via action
+                    a, logp = self.agent.actor.sample(feat)
+                    logps.append(logp)
+
+                    with torch.no_grad():
+                        mean_t, log_std_t = self.agent.actor.forward(feat)
+                        actor_means.append(mean_t)
+                        actor_log_stds.append(log_std_t)
+
+                    # Imagine next state; DO NOT detach action (we need pathwise gradient wrt action)
+                    s, _ = wm.rssm.imagine_step(s, a, sample=True)
+                    feat_next = wm.features(s)
+                    r = wm.predict_reward(feat_next)  # [B]
+                    rewards.append(r)
+
+                    # Dreamer: continue probability (P(not terminal))
+                    cont_logit = wm.predict_continue_logit(feat_next)
+                    cont_prob = torch.sigmoid(cont_logit).clamp(0.0, 1.0)
+                    done_probs.append(cont_prob)
+
+                feat_last = wm.features(s)
+
+                # stack rollout tensors
+                feats_t = torch.stack(feats, dim=1)        # [B,H,feat]
+                rewards_t = torch.stack(rewards, dim=1)    # [B,H]
+                logps_t = torch.stack(logps, dim=1)        # [B,H]
+                conts_t = torch.stack(done_probs, dim=1)   # [B,H]
+
+                # critic uses detached feats (no grad into WM)
+                feats_det = feats_t.detach()
+                flat_feats = feats_det.reshape(-1, feats_det.shape[-1])  # [B*H, feat]
+
+                # ---- critic predictions ----
+                # 1) Predictions WITH grad (for critic loss)
+                values_flat_pred = self.agent.critic(flat_feats)          # [B*H] requires grad
+                values_pred = values_flat_pred.reshape(B, H)              # [B,H]
+                # 2) Bootstrap value WITHOUT grad (stabilizes target and avoids critic->target leakage)
                 with torch.no_grad():
-                    mean_t, log_std_t = self.agent.actor.forward(feat)
-                    actor_means.append(mean_t)
-                    actor_log_stds.append(log_std_t)
+                    v_last = self.agent.critic(feat_last)                 # [B]
 
-                # Imagine next state; DO NOT detach action (we need pathwise gradient wrt action)
-                s, _ = wm.rssm.imagine_step(s, a, sample=True)
-                feat_next = wm.features(s)
-                r = wm.predict_reward(feat_next)  # [B]
-                rewards.append(r)
+                # Build bootstrap values tensor (detached)
+                values_ext_det = torch.cat([values_pred.detach(), v_last.detach().unsqueeze(1)], dim=1)  # [B,H+1]
 
-                # Dreamer: continue probability (P(not terminal))
-                cont_logit = wm.predict_continue_logit(feat_next)
-                cont_prob = torch.sigmoid(cont_logit).clamp(0.0, 1.0)
-                done_probs.append(cont_prob)
+                # per-step discounts should not backprop through continue head (stabilizes)
+                discounts = gamma * conts_t.detach()  # [B,H]
 
-            feat_last = wm.features(s)
+                ## Actor target WITH grad through rewards_t only (values are detached)
+                target_actor = lambda_returns(
+                    rewards=rewards_t,
+                    values=values_ext_det,
+                    discounts=discounts,
+                    lambda_=lam,
+                )  # [B,H]
 
-            # stack rollout tensors
-            feats_t = torch.stack(feats, dim=1)        # [B,H,feat]
-            rewards_t = torch.stack(rewards, dim=1)    # [B,H]
-            logps_t = torch.stack(logps, dim=1)        # [B,H]
-            conts_t = torch.stack(done_probs, dim=1)   # [B,H]
-
-            # critic uses detached feats (no grad into WM)
-            feats_det = feats_t.detach()
-            flat_feats = feats_det.reshape(-1, feats_det.shape[-1])  # [B*H, feat]
-
-            # ---- critic predictions ----
-            # 1) Predictions WITH grad (for critic loss)
-            values_flat_pred = self.agent.critic(flat_feats)          # [B*H] requires grad
-            values_pred = values_flat_pred.reshape(B, H)              # [B,H]
-            # 2) Bootstrap value WITHOUT grad (stabilizes target and avoids critic->target leakage)
-            with torch.no_grad():
-                v_last = self.agent.critic(feat_last)                 # [B]
-
-            # IMPORTANT:
-            # - Actor must get gradients through rewards_t (which depends on actions through dynamics).
-            # - Do NOT allow gradients into critic via the bootstrap values, so detach them.
-            # Build bootstrap values tensor (detached)
-            values_ext_det = torch.cat([values_pred.detach(), v_last.detach().unsqueeze(1)], dim=1)  # [B,H+1]
-
-            # per-step discounts should not backprop through continue head (stabilizes)
-            discounts = gamma * conts_t.detach()  # [B,H]
-
-            ## Actor target WITH grad through rewards_t only (values are detached)
-            target_actor = lambda_returns(
-                rewards=rewards_t,
-                values=values_ext_det,
-                discounts=discounts,
-                lambda_=lam,
-            )  # [B,H]
-
-            # Critic target is detached
-            target = target_actor.detach()
+                # Critic target is detached
+                target = target_actor.detach()
 
             # --- diagnostics ---
             step = int(self.state.env_step)
@@ -678,9 +682,17 @@ class Trainer:
             # --- actor update ---
             self.actor_opt.zero_grad(set_to_none=True)
 
-            # Dreamer pathwise objective: maximize imagined returns directly.
+            # Normalize returns so gradient scale stays stable as the agent improves.
+            # Without this, gradient norm grows ~100x from early (return≈5) to late (return≈500)
+            # causing the policy collapse / rollback cycles seen at 169 score.
+            with torch.no_grad():
+                batch_std = float(target_actor.float().std().item())
+                self._return_scale = 0.99 * self._return_scale + 0.01 * max(batch_std, 1.0)
+            self.tb.scalar("value/return_scale", self._return_scale, step)
+
+            # Dreamer pathwise objective: maximize normalized imagined returns.
             # (WM params frozen; gradients flow through action -> dynamics -> rewards/values)
-            actor_loss = -target_actor.mean()
+            actor_loss = -(target_actor / self._return_scale).mean()
             if float(cfg.agent.entropy_coef) != 0.0:
                 entropy_est = (-logps_t).mean()
                 actor_loss = actor_loss - float(cfg.agent.entropy_coef) * entropy_est

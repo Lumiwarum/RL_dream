@@ -5,6 +5,7 @@ exp_name: "default"
 seed: 0
 deterministic: true
 device: "cuda"   # set "cpu" if needed
+use_amp: true    # bfloat16 autocast on CUDA (same dynamic range as float32, ~1.5-2x faster matmuls)
 
 env:
   id: "InvertedPendulum-v5"
@@ -68,6 +69,9 @@ training:
   eval_episodes: 5
   checkpoint_every_steps: 5000
   log_episode_every: 10
+
+  # Checkpoint policy: only best.pt + end-of-chunk by default (set true to re-enable step snapshots)
+  save_periodic_checkpoints: false
 
   # Best checkpoint tracking
   best_min_delta: 1.0

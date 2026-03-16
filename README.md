@@ -70,8 +70,80 @@ python eval_latest_video.py --config quickstart --run_dir runs/<exp_name> --epis
 
 ## Experiments
 
-1. python scripts/run_experiments.py --group main --dry_run   # preview
-2. python scripts/run_experiments.py --group main             # run ~24 experiments
-3. python scripts/run_experiments.py --group ablation_metric  # then ablations
-4. python scripts/collect_results.py                          # extract + plot
-5. open thesis/thesis_skeleton.tex and replace \RESULT{} markers
+### Experiment groups
+
+| Group | Description | Experiments |
+|---|---|---|
+| `main` | Hopper + Walker2d × {fixed_h5, fixed_h15, fixed_h20, adaptive} × 3 seeds | 24 |
+| `ablation_metric` | Hopper × 3 uncertainty metrics × 3 seeds | 9 |
+| `ablation_ensemble` | Hopper × ensemble sizes {1,2,3} × 3 seeds | 12 |
+| `ablation_threshold` | Hopper × 4 threshold pairs × 3 seeds | 12 |
+
+### Running experiments
+
+```bash
+# 1. Preview commands without running (dry run)
+python scripts/run_experiments.py --group main --dry_run
+
+# 2. List all experiments in a group
+python scripts/run_experiments.py --group main --list
+
+# 3. Run sequentially (single GPU)
+python scripts/run_experiments.py --group main
+
+# 4. Run in parallel — 3 jobs at once, cycling across 2 GPUs
+python scripts/run_experiments.py --group main --parallel 3 --gpus 2
+
+# 5. Run in parallel on a single GPU (2 jobs share the GPU)
+python scripts/run_experiments.py --group main --parallel 2 --gpus 1
+
+# 6. Resume: skip already-completed experiments
+python scripts/run_experiments.py --group main --parallel 3 --gpus 2 --skip_done
+
+# 7. Run all groups back-to-back
+python scripts/run_experiments.py --group all --parallel 3 --gpus 2 --skip_done
+```
+
+> **Tip — GPU memory:** each job uses ~2–4 GB VRAM (ensemble_size=2, rollout_batch=512).
+> On a 24 GB card you can safely run `--parallel 4 --gpus 1`.
+> With 2 GPUs of 12 GB each, use `--parallel 4 --gpus 2`.
+
+### Collecting results and plotting
+
+```bash
+python scripts/collect_results.py
+```
+
+Reads `experiments/manifest.csv`, aggregates TensorBoard logs, and writes summary CSVs + plots to `experiments/results/`.
+
+### Full workflow
+
+```bash
+# Step 1 — main comparison (fixed horizons vs. adaptive)
+python scripts/run_experiments.py --group main --parallel 3 --gpus 2
+
+# Step 2 — ablations (can run while main is still going with --skip_done)
+python scripts/run_experiments.py --group ablation_metric --parallel 3 --gpus 2
+python scripts/run_experiments.py --group ablation_ensemble --parallel 3 --gpus 2
+python scripts/run_experiments.py --group ablation_threshold --parallel 3 --gpus 2
+
+# Step 3 — collect and plot
+python scripts/collect_results.py
+
+# Step 4 — monitor training live
+tensorboard --logdir runs --port 8032
+
+# Step 5 — fill in thesis
+# open thesis/thesis_skeleton.tex and replace \RESULT{} markers
+```
+
+### Checkpoint policy
+
+By default only two checkpoints are kept per run to save disk space:
+- `best.pt` — saved whenever a new best evaluation return is achieved
+- `latest.pt` — saved at the end of each training chunk (used for resuming)
+
+To re-enable periodic step snapshots (e.g. every 10k steps), set:
+```bash
+python train.py ... training.save_periodic_checkpoints=true
+```

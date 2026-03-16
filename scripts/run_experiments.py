@@ -41,6 +41,7 @@ import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 from pathlib import Path
@@ -289,7 +290,8 @@ def upsert_manifest(rows: dict[str, dict], exp: Experiment, **kwargs) -> None:
 
 # ── RUNNER ─────────────────────────────────────────────────────────────────────
 
-def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict]) -> bool:
+def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict],
+                   gpu_id: Optional[int] = None) -> bool:
     """Run a single experiment. Returns True if succeeded."""
     cmd = exp.build_cmd()
     print("\n" + "=" * 72)
@@ -298,6 +300,8 @@ def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict]) ->
     print(f"  Env    : {exp.env_id}")
     print(f"  Method : {exp.method}")
     print(f"  Seed   : {exp.seed}")
+    if gpu_id is not None:
+        print(f"  GPU    : {gpu_id}")
     print(f"  Cmd    : {' '.join(cmd)}")
     print("=" * 72)
 
@@ -309,9 +313,13 @@ def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict]) ->
                     start_time=datetime.now().isoformat())
     save_manifest(manifest)
 
+    env = os.environ.copy()
+    if gpu_id is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     t0 = time.time()
     try:
-        result = subprocess.run(cmd, check=True, cwd=str(ROOT))
+        subprocess.run(cmd, check=True, cwd=str(ROOT), env=env)
         elapsed = time.time() - t0
         upsert_manifest(manifest, exp, status="done",
                         end_time=datetime.now().isoformat())
@@ -325,6 +333,39 @@ def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict]) ->
         save_manifest(manifest)
         print(f"[FAILED] {exp.exp_name} after {elapsed/60:.1f} min — returncode {e.returncode}")
         return False
+
+
+def _worker(args):
+    """Top-level picklable wrapper for ProcessPoolExecutor."""
+    exp, dry_run, gpu_id = args
+    # Each worker reloads the manifest from disk (avoids cross-process dict sharing)
+    manifest = load_manifest()
+    return run_experiment(exp, dry_run=dry_run, manifest=manifest, gpu_id=gpu_id)
+
+
+def run_experiments_parallel(experiments: List[Experiment], dry_run: bool,
+                              n_workers: int, n_gpus: int) -> tuple[int, int]:
+    """Run experiments in parallel across n_workers processes, cycling over n_gpus GPUs."""
+    tasks = [
+        (exp, dry_run, (i % n_gpus) if n_gpus > 0 else None)
+        for i, exp in enumerate(experiments)
+    ]
+    n_success = 0
+    n_fail = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker, t): t[0] for t in tasks}
+        for fut in as_completed(futures):
+            exp = futures[fut]
+            try:
+                ok = fut.result()
+            except Exception as exc:
+                print(f"[ERROR] {exp.exp_name} raised {exc}")
+                ok = False
+            if ok:
+                n_success += 1
+            else:
+                n_fail += 1
+    return n_success, n_fail
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -352,6 +393,16 @@ def parse_args():
     p.add_argument(
         "--list", action="store_true",
         help="List all experiments in the selected group and exit.",
+    )
+    p.add_argument(
+        "--parallel", type=int, default=1, metavar="N",
+        help="Run up to N experiments simultaneously (default: 1 = sequential). "
+             "Use --gpus to specify how many GPUs to cycle across.",
+    )
+    p.add_argument(
+        "--gpus", type=int, default=1, metavar="N",
+        help="Number of GPUs to cycle CUDA_VISIBLE_DEVICES across when --parallel > 1 "
+             "(default: 1). Set 0 to leave CUDA_VISIBLE_DEVICES unset.",
     )
     return p.parse_args()
 
@@ -383,24 +434,34 @@ def main():
             upsert_manifest(manifest, exp, status="pending")
     save_manifest(manifest)
 
-    print(f"\n==> Running {len(experiments)} experiments (group={args.group})")
+    print(f"\n==> Running {len(experiments)} experiments (group={args.group}, "
+          f"parallel={args.parallel}, gpus={args.gpus})")
 
-    n_success = 0
+    # Filter skip_done before dispatching
+    pending = []
     n_skip = 0
-    n_fail = 0
-
     for exp in experiments:
         row = manifest.get(exp.exp_name, {})
         if args.skip_done and row.get("status") == "done":
             print(f"[SKIP] {exp.exp_name} (already done)")
             n_skip += 1
-            continue
-
-        ok = run_experiment(exp, dry_run=args.dry_run, manifest=manifest)
-        if ok:
-            n_success += 1
         else:
-            n_fail += 1
+            pending.append(exp)
+
+    if args.parallel > 1:
+        n_success, n_fail = run_experiments_parallel(
+            pending, dry_run=args.dry_run,
+            n_workers=args.parallel, n_gpus=args.gpus,
+        )
+    else:
+        n_success = 0
+        n_fail = 0
+        for exp in pending:
+            ok = run_experiment(exp, dry_run=args.dry_run, manifest=manifest)
+            if ok:
+                n_success += 1
+            else:
+                n_fail += 1
 
     print(f"\n{'='*72}")
     print(f"Finished: {n_success} ok / {n_skip} skipped / {n_fail} failed")
