@@ -70,8 +70,9 @@ training:
   checkpoint_every_steps: 5000
   log_episode_every: 10
 
-  # Checkpoint policy: only best.pt + end-of-chunk by default (set true to re-enable step snapshots)
-  save_periodic_checkpoints: false
+  # Checkpoint policy
+  save_periodic_checkpoints: false  # named step_N.pt snapshots (disabled = saves disk)
+  save_latest_every_steps: 10000   # overwrite latest.pt in-place for crash recovery (no new files)
 
   # Best checkpoint tracking
   best_min_delta: 1.0

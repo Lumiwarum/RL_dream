@@ -18,7 +18,7 @@ import math
 from thesiswm.agents.actor_critic import ActorCritic
 from thesiswm.data.replay_buffer import ReplayBuffer
 from thesiswm.envs.make_env import make_env
-from thesiswm.models.rssm import EnsembleWorldModel
+from thesiswm.models.rssm import EnsembleWorldModel, RSSMState
 from thesiswm.training.imagination import decide_horizon, lambda_returns
 from thesiswm.utils.checkpoint import Checkpointer
 from thesiswm.utils.logger import TBLogger
@@ -127,7 +127,7 @@ class Trainer:
                 try:
                     ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
                     self.checkpointer.load_into(self, ckpt)
-                    print(f"[RESUME] loaded {best_path} (env_step={self.state.env_step})")
+                    print(f"[RESUME] loaded {best_path} (env_step={self.state.env_step})", flush=True)
                 except Exception:
                     pass
             elif latest is not None:
@@ -146,6 +146,8 @@ class Trainer:
     def evaluate_deterministic(self, episodes: int = 5) -> float:
         cfg = self.cfg
         device = self.device
+        wm0 = self.world_model_ensemble.models[0]
+        _amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp)
 
         env = make_env(cfg.env.id, seed=int(cfg.seed) + 12345, render_mode=None)
         returns = []
@@ -156,10 +158,25 @@ class Trainer:
             trunc = False
             ret = 0.0
 
+            # Maintain RSSM state across steps: avoids re-initializing from zeros every step.
+            # Previous action starts as zeros (no history at episode start).
+            state = wm0.rssm.init_state(1, device)
+            prev_action = torch.zeros(1, wm0.rssm.act_dim, device=device)
+
             while not (done or trunc):
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                action = self.agent.act_deterministic_from_obs(obs_t, self.world_model_ensemble, device=device)
-                action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
+                with _amp_ctx:
+                    # One GRU step using previous z + previous action, then posterior from obs
+                    h = wm0.rssm.deter_step(state.h, state.z, prev_action)
+                    post_dist = wm0.rssm.posterior(h, obs_t)
+                    z = post_dist.mean  # deterministic (mean) for eval
+                    feat = torch.cat([h, z], dim=-1)
+                    action = self.agent.actor.mean_action(feat)
+                # Keep state in float32 so next GRU step inputs are consistent
+                state = RSSMState(h=h.float(), z=z.float())
+
+                action_np = action.squeeze(0).float().cpu().numpy()
+                prev_action = action.detach().float()
 
                 obs, reward, done, trunc, _ = env.step(action_np)
                 ret += float(reward)
@@ -184,7 +201,8 @@ class Trainer:
         total_steps = int(cfg.training.total_steps)
         chunk_steps = int(cfg.training.steps_per_chunk)
         start_step = int(self.state.env_step)
-        end_step = min(total_steps, start_step + chunk_steps)
+        chunk_idx = start_step // chunk_steps
+        end_step = min(total_steps, (chunk_idx + 1) * chunk_steps)
         # periodic deterministic eval + best checkpoint + rollback
         eval_every = int(getattr(cfg.training, "eval_every_steps", 2000))
         eval_episodes = int(getattr(cfg.training, "eval_episodes", 5))
@@ -200,7 +218,8 @@ class Trainer:
         train_rollback_patience = int(getattr(cfg.training, "train_rollback_patience", 3))
         train_bad_streak = 0
 
-        _save_periodic = bool(getattr(cfg.training, "save_periodic_checkpoints", False))
+        _save_periodic     = bool(getattr(cfg.training, "save_periodic_checkpoints", False))
+        _save_latest_every = int(getattr(cfg.training, "save_latest_every_steps", 10000))
 
         obs, _ = self.env.reset(seed=int(cfg.seed) + self.state.env_step)
         obs = np.asarray(obs, dtype=np.float32)
@@ -255,7 +274,7 @@ class Trainer:
                         mean_train_ret = float(np.mean(recent_returns))
                         if mean_train_ret > (self.best_train_return + train_best_min_delta):
                             self.best_train_return = mean_train_ret
-                            ckpt = self.checkpointer.make_checkpoint(self)
+                            ckpt = self.checkpointer.make_weights_checkpoint(self)
                             self.checkpointer.save(ckpt, tag="best_train", make_latest=False)
                             self.tb.scalar("train/best_return", self.best_train_return, self.state.env_step)
                             print(f"[BEST_TRAIN] New best training return: {self.best_train_return:.2f} at step {self.state.env_step}")
@@ -339,8 +358,21 @@ class Trainer:
                         self.tb.scalar("loss/critic", critic_loss, self.state.env_step)
                         self.tb.scalar("imagination/horizon_used", horizon_used, self.state.env_step)
                         self.tb.scalar("imagination/uncertainty_mean", unc_mean, self.state.env_step)
+                        # Terse progress line — picked up by orchestrator log-tailer
+                        print(
+                            f"[PROGRESS] step={self.state.env_step:>7d}/{end_step}"
+                            f"  fps={fps:5.0f}"
+                            f"  wm={wm_loss:.3f}  actor={actor_loss:.4f}  critic={critic_loss:.3f}"
+                            f"  best_eval={self.best_eval_return:.1f}",
+                            flush=True,
+                        )
 
-            # checkpoint (periodic step saves disabled by default — only best.pt + end-of-chunk)
+            # Overwrite latest.pt periodically — no new files, just crash-recovery insurance.
+            # With 200k-step chunks and no periodic step files, a crash would lose the whole chunk.
+            if self.state.env_step % _save_latest_every == 0:
+                self.save_checkpoint(tag="latest", make_latest=False)
+
+            # Named step snapshots (disabled by default, set save_periodic_checkpoints=true to enable)
             if (_save_periodic
                     and self.state.env_step % int(cfg.training.checkpoint_every_steps) == 0):
                 self.save_checkpoint(tag=f"step_{self.state.env_step}")
@@ -399,7 +431,7 @@ class Trainer:
                             self.bad_eval_streak = 0
                             # Log rollback with details
                             print(f"[ROLLBACK] step={current_step}, loaded weights from step={ckpt_step}, "
-                                  f"noise_scale={rollback_noise:.4f}, lr_scale={rollback_lr_scale}")
+                                  f"noise_scale={rollback_noise:.4f}, lr_scale={rollback_lr_scale}", flush=True)
                             self.tb.scalar("eval/rollback", 1.0, self.state.env_step)
                             self.tb.scalar("eval/rollback_from_step", float(ckpt_step), self.state.env_step)
                         else:
@@ -407,7 +439,7 @@ class Trainer:
 
         # Final save for chunk
         self.save_checkpoint(tag=f"step_{self.state.env_step}", make_latest=True)
-        print(f"[DONE] chunk complete: env_step={self.state.env_step}/{total_steps}  run_dir={self.run_dir}")
+        print(f"[DONE] chunk complete: env_step={self.state.env_step}/{total_steps}  run_dir={self.run_dir}", flush=True)
         self.close()
 
     def save_checkpoint(self, tag: str, make_latest: bool = True):
@@ -448,12 +480,19 @@ class Trainer:
             with _amp_ctx:
                 states, post_dists, prior_dists = wm.rssm.observe_sequence(obs, actions, device=self.device, sample=True)
 
-                next_states = []
-                for t, s_t in enumerate(states):
-                    s_next, _ = wm.rssm.imagine_step(s_t, actions[:, t])
-                    next_states.append(s_next)
-                next_feats = torch.stack([wm.features(s) for s in next_states], dim=1)
-                flat_next = next_feats.reshape(-1, next_feats.shape[-1])
+                # Reuse h from observe_sequence (states[t+1].h == imagine_step(states[t], a_t).h).
+                # Only the final step needs one extra GRU forward.
+                T = len(states)
+                h_nexts_list = [states[t].h for t in range(1, T)]
+                h_T = wm.rssm.deter_step(states[-1].h, states[-1].z, actions[:, -1])
+                h_nexts = torch.stack(h_nexts_list + [h_T], dim=1)  # [B, T, deter_dim]
+                # Vectorised prior over all T next h's — avoids T-1 redundant GRU calls
+                h_flat = h_nexts.reshape(-1, h_nexts.shape[-1])          # [B*T, deter_dim]
+                prior_params = wm.rssm.prior_net(h_flat)
+                mean_p, std_param = torch.chunk(prior_params, 2, dim=-1)
+                std_p = F.softplus(std_param) + wm.rssm.min_std
+                z_nexts = mean_p + torch.randn_like(mean_p) * std_p      # reparameterised sample
+                flat_next = torch.cat([h_flat, z_nexts], dim=-1)         # [B*T, feat_dim]
                 cont_logits = wm.predict_continue_logit(flat_next).reshape(terminated.shape)
 
                 # ---- IMPORTANT FIX: predict next_obs, not obs ----

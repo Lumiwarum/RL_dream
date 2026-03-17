@@ -40,6 +40,7 @@ import csv
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, fields
@@ -288,26 +289,57 @@ def upsert_manifest(rows: dict[str, dict], exp: Experiment, **kwargs) -> None:
     rows[exp.exp_name] = row
 
 
+# ── LOG TAILER ─────────────────────────────────────────────────────────────────
+
+# Lines from train.py that are worth showing in the terminal.
+_INTERESTING = ("[PROGRESS]", "[DONE]", "[ROLLBACK]", "[RESUME]", "[FAILED]")
+
+def _log_tailer(log_path: Path, tag: str, stop: threading.Event) -> None:
+    """Background thread: poll log_path and forward structured lines to stdout."""
+    pos = 0
+    while not stop.wait(timeout=5.0):   # check every 5 s; exits when stop is set
+        try:
+            text = log_path.read_text(errors="replace")
+        except OSError:
+            continue
+        chunk = text[pos:]
+        pos = len(text)
+        for line in chunk.splitlines():
+            if any(line.startswith(kw) for kw in _INTERESTING):
+                print(f"  [{tag}] {line}", flush=True)
+    # One final drain after the subprocess exits
+    try:
+        text = log_path.read_text(errors="replace")
+        for line in text[pos:].splitlines():
+            if any(line.startswith(kw) for kw in _INTERESTING):
+                print(f"  [{tag}] {line}", flush=True)
+    except OSError:
+        pass
+
+
 # ── RUNNER ─────────────────────────────────────────────────────────────────────
+
+def _tag(exp: Experiment, gpu_id: Optional[int]) -> str:
+    """Short one-line identifier: env | method | seed [GPU:N]."""
+    gpu_str = f" [GPU:{gpu_id}]" if gpu_id is not None else ""
+    return f"{exp.env_id} | {exp.method} | seed={exp.seed}{gpu_str}"
+
 
 def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict],
                    gpu_id: Optional[int] = None) -> bool:
     """Run a single experiment. Returns True if succeeded."""
     cmd = exp.build_cmd()
-    print("\n" + "=" * 72)
-    print(f"[RUN] {exp.exp_name}")
-    print(f"  Group  : {exp.group}")
-    print(f"  Env    : {exp.env_id}")
-    print(f"  Method : {exp.method}")
-    print(f"  Seed   : {exp.seed}")
-    if gpu_id is not None:
-        print(f"  GPU    : {gpu_id}")
-    print(f"  Cmd    : {' '.join(cmd)}")
-    print("=" * 72)
+    tag = _tag(exp, gpu_id)
 
     if dry_run:
-        print("  [DRY RUN — skipping]")
+        print(f"[DRY RUN]  {tag}")
+        print(f"           cmd: {' '.join(cmd)}")
         return True
+
+    # Log file: runs/<exp_name>/train.log  (trainer creates the dir; we pre-create it here)
+    log_dir = ROOT / "runs" / exp.exp_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "train.log"
 
     upsert_manifest(manifest, exp, status="running",
                     start_time=datetime.now().isoformat())
@@ -317,22 +349,56 @@ def run_experiment(exp: Experiment, dry_run: bool, manifest: dict[str, dict],
     if gpu_id is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
+    print(f"[START]  {tag}  →  log: runs/{exp.exp_name}/train.log")
+
+    # Short tag for tailer prefix: "Hopper-v4|fixed_h5|s0"
+    short = f"{exp.env_id}|{exp.method}|s{exp.seed}"
+    stop_tailer = threading.Event()
+    tailer = threading.Thread(
+        target=_log_tailer, args=(log_path, short, stop_tailer), daemon=True
+    )
+
     t0 = time.time()
-    try:
-        subprocess.run(cmd, check=True, cwd=str(ROOT), env=env)
-        elapsed = time.time() - t0
-        upsert_manifest(manifest, exp, status="done",
-                        end_time=datetime.now().isoformat())
-        save_manifest(manifest)
-        print(f"[DONE] {exp.exp_name} in {elapsed/60:.1f} min")
-        return True
-    except subprocess.CalledProcessError as e:
-        elapsed = time.time() - t0
-        upsert_manifest(manifest, exp, status="failed",
-                        end_time=datetime.now().isoformat())
-        save_manifest(manifest)
-        print(f"[FAILED] {exp.exp_name} after {elapsed/60:.1f} min — returncode {e.returncode}")
-        return False
+    with open(log_path, "a") as log_f:
+        tailer.start()
+        try:
+            subprocess.run(cmd, check=True, cwd=str(ROOT), env=env,
+                           stdout=log_f, stderr=log_f)
+            elapsed = time.time() - t0
+            upsert_manifest(manifest, exp, status="done",
+                            end_time=datetime.now().isoformat())
+            save_manifest(manifest)
+            stop_tailer.set()
+            tailer.join(timeout=3)
+            print(f"[DONE]   {tag}  ({elapsed/60:.1f} min)")
+            return True
+        except subprocess.CalledProcessError as e:
+            elapsed = time.time() - t0
+            upsert_manifest(manifest, exp, status="failed",
+                            end_time=datetime.now().isoformat())
+            save_manifest(manifest)
+            stop_tailer.set()
+            tailer.join(timeout=3)
+            print(f"[FAILED] {tag}  ({elapsed/60:.1f} min, rc={e.returncode})")
+            try:
+                lines = log_path.read_text().splitlines()
+                tail = lines[-20:] if len(lines) > 20 else lines
+                print(f"  --- last {len(tail)} lines of {log_path.name} ---")
+                for line in tail:
+                    print(f"  {line}")
+            except Exception:
+                pass
+            return False
+        except KeyboardInterrupt:
+            # User pressed Ctrl+C — mark as pending so next run retries it
+            elapsed = time.time() - t0
+            upsert_manifest(manifest, exp, status="pending",
+                            end_time=datetime.now().isoformat())
+            save_manifest(manifest)
+            stop_tailer.set()
+            tailer.join(timeout=3)
+            print(f"[INTERRUPTED] {tag}  ({elapsed/60:.1f} min) — marked pending for retry")
+            raise  # propagate so the outer loop / pool can stop cleanly
 
 
 def _worker(args):
@@ -359,7 +425,7 @@ def run_experiments_parallel(experiments: List[Experiment], dry_run: bool,
             try:
                 ok = fut.result()
             except Exception as exc:
-                print(f"[ERROR] {exp.exp_name} raised {exc}")
+                print(f"[ERROR]  {_tag(exp, None)}  —  {exc}")
                 ok = False
             if ok:
                 n_success += 1
@@ -428,6 +494,14 @@ def main():
 
     manifest = load_manifest()
 
+    # Reset any "running" entries to "pending" — they were interrupted (crash / Ctrl+C)
+    # and must be retried. "done" entries are never touched.
+    stale = [name for name, row in manifest.items() if row.get("status") == "running"]
+    if stale:
+        print(f"[CLEANUP] {len(stale)} interrupted run(s) reset to pending: {', '.join(stale)}")
+        for name in stale:
+            manifest[name]["status"] = "pending"
+
     # Register all experiments in the manifest (status=pending if new)
     for exp in experiments:
         if exp.exp_name not in manifest:
@@ -443,28 +517,33 @@ def main():
     for exp in experiments:
         row = manifest.get(exp.exp_name, {})
         if args.skip_done and row.get("status") == "done":
-            print(f"[SKIP] {exp.exp_name} (already done)")
+            print(f"[SKIP]   {_tag(exp, None)}")
             n_skip += 1
         else:
             pending.append(exp)
 
-    if args.parallel > 1:
-        n_success, n_fail = run_experiments_parallel(
-            pending, dry_run=args.dry_run,
-            n_workers=args.parallel, n_gpus=args.gpus,
-        )
-    else:
-        n_success = 0
-        n_fail = 0
-        for exp in pending:
-            ok = run_experiment(exp, dry_run=args.dry_run, manifest=manifest)
-            if ok:
-                n_success += 1
-            else:
-                n_fail += 1
+    n_success = 0
+    n_fail = 0
+    try:
+        if args.parallel > 1:
+            n_success, n_fail = run_experiments_parallel(
+                pending, dry_run=args.dry_run,
+                n_workers=args.parallel, n_gpus=args.gpus,
+            )
+        else:
+            for exp in pending:
+                ok = run_experiment(exp, dry_run=args.dry_run, manifest=manifest)
+                if ok:
+                    n_success += 1
+                else:
+                    n_fail += 1
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Ctrl+C received — stopping. Interrupted runs were marked pending.")
 
     print(f"\n{'='*72}")
-    print(f"Finished: {n_success} ok / {n_skip} skipped / {n_fail} failed")
+    print(f"Finished: {n_success} ok / {n_skip} skipped / {n_fail} failed"
+          + (f" / {len(pending) - n_success - n_fail} pending (interrupted)"
+             if n_success + n_fail < len(pending) else ""))
     print(f"Manifest: {MANIFEST_PATH}")
 
 

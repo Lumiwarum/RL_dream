@@ -45,6 +45,22 @@ class Checkpointer:
         }
         return ckpt
 
+    def make_weights_checkpoint(self, trainer: Any) -> Dict[str, Any]:
+        """Lightweight checkpoint: weights + metrics only, no replay buffer or optimizer state.
+        Used for best_train rollback checkpoints to keep save cost low (~5MB vs ~100MB)."""
+        return {
+            "state": {
+                "env_step": int(trainer.state.env_step),
+                "updates": int(trainer.state.updates),
+            },
+            "world_model": trainer.world_model_ensemble.state_dict(),
+            "agent": trainer.agent.state_dict(),
+            "metrics": {
+                "best_eval_return":  float(getattr(trainer, "best_eval_return",  -1e9)),
+                "best_train_return": float(getattr(trainer, "best_train_return", -1e9)),
+            }
+        }
+
     def save(self, ckpt: Dict[str, Any], tag: str, make_latest: bool = True) -> str:
         path = os.path.join(self.ckpt_dir, f"{tag}.pt")
         torch.save(ckpt, path)
