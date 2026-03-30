@@ -100,11 +100,15 @@ class ReplayBuffer:
 
     def sample_sequences(self, batch_size: int, seq_len: int) -> Dict[str, np.ndarray]:
         """
-        Sample sequences of length seq_len. We avoid crossing episode boundaries by rejecting starts
-        where any episode boundary occurs in the first (seq_len-1) steps.
+        Sample sequences of length seq_len. Avoids crossing episode boundaries by rejecting
+        starts where any is_last occurs in the first (seq_len-1) steps.
+
+        Uses fully-vectorized numpy operations instead of a Python loop — O(1) numpy
+        calls regardless of batch size, eliminating the main CPU bottleneck as the buffer
+        grows large and causes cache pressure.
 
         Returns arrays shaped:
-          obs:        [B, T, obs_dim]   (current obs)
+          obs:        [B, T, obs_dim]
           actions:    [B, T, act_dim]
           rewards:    [B, T]
           terminated: [B, T]
@@ -115,35 +119,35 @@ class ReplayBuffer:
         assert n >= seq_len + 1, "Not enough data for sequence sampling."
         B = int(batch_size)
         T = int(seq_len)
+        upper = n - T  # exclusive upper bound for start index
 
-        starts = []
-        max_tries = B * 50
-        tries = 0
-        while len(starts) < B and tries < max_tries:
-            s = np.random.randint(0, n - T)
-            # Reject if episode boundary is inside the sequence (excluding final step).
-            if np.any(self.is_last[s : s + T - 1] > 0.5):
-                tries += 1
-                continue
-            starts.append(s)
-            tries += 1
+        # --- Vectorized valid-start selection ---
+        # Generate a large pool, check all boundaries at once, take first B valid.
+        pool_size = min(B * 16, upper)
+        candidates = np.random.randint(0, upper, size=pool_size)
 
-        if len(starts) < B:
-            # Fallback: allow boundaries if data is sparse, but this is less ideal.
-            starts = list(np.random.randint(0, n - T, size=(B,)))
+        # Boundary check: is_last[s : s+T-1] must be all zeros.
+        # Shape: [pool_size, T-1] — single numpy fancy-index, no Python loop.
+        win_idx = candidates[:, None] + np.arange(T - 1)[None, :]   # [P, T-1]
+        has_boundary = self.is_last[win_idx].any(axis=1)              # [P]
+        valid = candidates[~has_boundary]
 
-        obs = np.stack([self.obs[s : s + T] for s in starts], axis=0)
-        actions = np.stack([self.actions[s : s + T] for s in starts], axis=0)
-        rewards = np.stack([self.rewards[s : s + T] for s in starts], axis=0)
-        terminated = np.stack([self.terminated[s : s + T] for s in starts], axis=0)
-        is_last = np.stack([self.is_last[s : s + T] for s in starts], axis=0)
-        next_obs = np.stack([self.next_obs[s : s + T] for s in starts], axis=0)
+        if len(valid) >= B:
+            starts = valid[:B]
+        else:
+            # Not enough clean sequences — top up with possibly boundary-crossing ones.
+            shortfall = B - len(valid)
+            extra = np.random.randint(0, upper, size=(shortfall,))
+            starts = np.concatenate([valid, extra])
+
+        # --- Vectorized gather: one numpy fancy-index call per field ---
+        idxs = starts[:, None] + np.arange(T)[None, :]  # [B, T]
 
         return {
-            "obs": obs,
-            "actions": actions,
-            "rewards": rewards,
-            "terminated": terminated,
-            "is_last": is_last,
-            "next_obs": next_obs,
+            "obs":        self.obs[idxs],         # [B, T, obs_dim]
+            "actions":    self.actions[idxs],      # [B, T, act_dim]
+            "rewards":    self.rewards[idxs],      # [B, T]
+            "terminated": self.terminated[idxs],   # [B, T]
+            "is_last":    self.is_last[idxs],      # [B, T]
+            "next_obs":   self.next_obs[idxs],     # [B, T, obs_dim]
         }

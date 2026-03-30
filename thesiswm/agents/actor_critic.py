@@ -37,15 +37,15 @@ class TanhGaussianPolicy(nn.Module):
 
         # log_prob with tanh correction
         # Use math.pi for precision and clamp action to prevent boundary issues
-        action_clamped = action.clamp(-0.999999, 0.999999)  # Safe boundary
-
         log_prob = -0.5 * (
-            ((pre_tanh - mean) / (std + 1e-8)) ** 2 
-            + 2 * log_std 
+            ((pre_tanh - mean) / (std + 1e-8)) ** 2
+            + 2 * log_std
             + torch.log(torch.tensor(2.0 * math.pi, device=x.device, dtype=std.dtype))
         ).sum(dim=-1)
 
-        log_prob = log_prob - torch.log(1.0 - action_clamped.pow(2)).sum(dim=-1)
+        # Jacobian correction for tanh squashing: log|d(tanh(u))/du| = log(1 - tanh²(u))
+        # Use epsilon inside the log (not clamp) so gradient flows correctly for saturated actions.
+        log_prob = log_prob - torch.log(1.0 - action.pow(2) + 1e-6).sum(dim=-1)
         return action, log_prob
 
     def mean_action(self, x: torch.Tensor) -> torch.Tensor:

@@ -98,15 +98,28 @@ python scripts/run_experiments.py --group main --parallel 3 --gpus 2
 python scripts/run_experiments.py --group main --parallel 2 --gpus 1
 
 # 6. Resume: skip already-completed experiments
-python scripts/run_experiments.py --group main --parallel 3 --gpus 2 --skip_done
+python scripts/run_experiments.py --group main --parallel 6 --gpus 3 --skip_done
 
 # 7. Run all groups back-to-back
-python scripts/run_experiments.py --group all --parallel 3 --gpus 2 --skip_done
+python scripts/run_experiments.py --group all --parallel 6 --gpus 3 --skip_done
+
+# 8. Re-run a group from scratch (e.g. after deleting run directories)
+#    --reset marks all experiments in the group back to 'pending' before running.
+#    Other groups in the manifest are NOT affected.
+python scripts/run_experiments.py --group main --parallel 6 --gpus 3 --reset
 ```
 
 > **Tip — GPU memory:** each job uses ~2–4 GB VRAM (ensemble_size=2, rollout_batch=512).
 > On a 24 GB card you can safely run `--parallel 4 --gpus 1`.
 > With 2 GPUs of 12 GB each, use `--parallel 4 --gpus 2`.
+
+> **Tip — FPS and `num_envs`:** adding more parallel environments does **not** improve FPS if
+> `updates_per_step` is scaled proportionally. With N envs and `collect_per_step=4`, each outer
+> loop collects `4×N` transitions and fires `updates_per_step` GPU gradient updates.
+> FPS ∝ `(4×N) / (updates_per_step × T_gpu)`.
+> To actually gain speed from more envs, keep `updates_per_step` fixed (e.g. 4) regardless of N.
+> With `num_envs=8` and `updates_per_step=4` you get ~2× the FPS vs `num_envs=4` at a slightly
+> lower update intensity (1 update per 8 transitions instead of 1 per 4).
 
 ### Collecting results and plotting
 

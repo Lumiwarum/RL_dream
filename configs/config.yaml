@@ -9,7 +9,7 @@ use_amp: true    # bfloat16 autocast on CUDA (same dynamic range as float32, ~1.
 
 env:
   id: "InvertedPendulum-v5"
-  num_envs: 1
+  num_envs: 4        # parallel collection envs (uses AsyncVectorEnv, each on its own CPU core)
   action_repeat: 1
 
 replay:
@@ -22,9 +22,11 @@ world_model:
   obs_dim: null          # auto-filled from env at runtime
   act_dim: null          # auto-filled
   latent_dim: 64
-  deter_dim: 256
-  hidden_dim: 512
-  kl_beta: 1.0
+  deter_dim: 128         # 256 is image-scale; 128 is plenty for state-vector obs
+  hidden_dim: 256        # 512 is image-scale; 256 gives ~3x faster updates on state tasks
+  kl_beta: 0.5         # gentler KL penalty; obs reconstruction gets more relative weight
+  free_nats: 1.0       # total KL floor (not per-dim); applied as max(KL_sum, free_nats)
+  sigreg_weight: 0.01  # was 0.1; large values fight the posterior encoding information
   lr: 3e-4
   grad_clip: 100.0
 
@@ -73,6 +75,9 @@ training:
   # Checkpoint policy
   save_periodic_checkpoints: false  # named step_N.pt snapshots (disabled = saves disk)
   save_latest_every_steps: 10000   # overwrite latest.pt in-place for crash recovery (no new files)
+
+  # Eval episode cap — prevents eval from taking 10-20x longer as the agent improves
+  eval_max_episode_steps: 1000
 
   # Best checkpoint tracking
   best_min_delta: 1.0

@@ -17,12 +17,13 @@ import math
 
 from thesiswm.agents.actor_critic import ActorCritic
 from thesiswm.data.replay_buffer import ReplayBuffer
-from thesiswm.envs.make_env import make_env
+from thesiswm.envs.make_env import make_env, make_vec_env
 from thesiswm.models.rssm import EnsembleWorldModel, RSSMState
 from thesiswm.training.imagination import decide_horizon, lambda_returns
 from thesiswm.utils.checkpoint import Checkpointer
 from thesiswm.utils.logger import TBLogger
 from thesiswm.utils.rng import capture_rng_state, restore_rng_state
+from thesiswm.utils.sigreg import SIGReg
 from thesiswm.models.networks import DiagGaussian
 
 
@@ -62,16 +63,24 @@ class Trainer:
         self.tb = TBLogger(self.writer)
 
         # env
+        self.num_envs = int(getattr(cfg.env, "num_envs", 1))
         self.env = None
         if build_env:
-            self.env = make_env(str(cfg.env.id), seed=int(cfg.seed), render_mode=None)
+            if self.num_envs > 1:
+                self.env = make_vec_env(str(cfg.env.id), num_envs=self.num_envs, seed=int(cfg.seed))
+            else:
+                self.env = make_env(str(cfg.env.id), seed=int(cfg.seed), render_mode=None)
 
         # infer dims
         if build_env:
             obs, _ = self.env.reset(seed=int(cfg.seed))
             obs = np.asarray(obs, dtype=np.float32)
-            obs_dim = int(obs.shape[0])
-            act_dim = int(self.env.action_space.shape[0])
+            if self.num_envs > 1:
+                obs_dim = int(obs.shape[1])
+                act_dim = int(self.env.single_action_space.shape[0])
+            else:
+                obs_dim = int(obs.shape[0])
+                act_dim = int(self.env.action_space.shape[0])
         else:
             obs_dim = int(cfg.world_model.obs_dim) if cfg.world_model.obs_dim is not None else 0
             act_dim = int(cfg.world_model.act_dim) if cfg.world_model.act_dim is not None else 0
@@ -116,26 +125,25 @@ class Trainer:
         # Enabled only on CUDA; silently off on CPU.
         self.use_amp = (self.device.type == "cuda") and bool(getattr(cfg, "use_amp", False))
 
+        # SIGReg: characteristic-function Gaussian regularizer (Le-WM, 2025).
+        # Pushes posterior z marginal toward N(0,I), complementing the KL term.
+        self.sigreg = SIGReg(knots=17, num_proj=1024).to(self.device)
+
         # checkpointing
         self.checkpointer = Checkpointer(self.ckpt_dir)
 
         # resume if requested
         if bool(cfg.training.resume):
+            # Always resume from latest.pt (most recent progress).
+            # best.pt may be at a much earlier step and would cause chunk_idx to
+            # recompute incorrectly, making end_step wrong on resume.
             latest = self.checkpointer.latest_path()
-            best_path = self.checkpointer.best_path()
-            if best_path is not None:
-                try:
-                    ckpt = torch.load(best_path, map_location=self.device, weights_only=False)
-                    self.checkpointer.load_into(self, ckpt)
-                    print(f"[RESUME] loaded {best_path} (env_step={self.state.env_step})", flush=True)
-                except Exception:
-                    pass
-            elif latest is not None:
+            if latest is not None:
                 ckpt = torch.load(latest, map_location=self.device, weights_only=False)
                 self.checkpointer.load_into(self, ckpt)
-                print(f"[RESUME] loaded {latest} (env_step={self.state.env_step})")
+                print(f"[RESUME] loaded {latest} (env_step={self.state.env_step})", flush=True)
             else:
-                print("[RESUME] no latest checkpoint found; starting fresh.")
+                print("[RESUME] no checkpoint found; starting fresh.")
 
     def close(self):
         if self.env is not None:
@@ -148,6 +156,7 @@ class Trainer:
         device = self.device
         wm0 = self.world_model_ensemble.models[0]
         _amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp)
+        max_ep_steps = int(getattr(cfg.training, "eval_max_episode_steps", 1000))
 
         env = make_env(cfg.env.id, seed=int(cfg.seed) + 12345, render_mode=None)
         returns = []
@@ -157,13 +166,14 @@ class Trainer:
             done = False
             trunc = False
             ret = 0.0
+            ep_steps = 0
 
             # Maintain RSSM state across steps: avoids re-initializing from zeros every step.
             # Previous action starts as zeros (no history at episode start).
             state = wm0.rssm.init_state(1, device)
             prev_action = torch.zeros(1, wm0.rssm.act_dim, device=device)
 
-            while not (done or trunc):
+            while not (done or trunc) and ep_steps < max_ep_steps:
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 with _amp_ctx:
                     # One GRU step using previous z + previous action, then posterior from obs
@@ -180,6 +190,7 @@ class Trainer:
 
                 obs, reward, done, trunc, _ = env.step(action_np)
                 ret += float(reward)
+                ep_steps += 1
 
             returns.append(ret)
 
@@ -191,10 +202,11 @@ class Trainer:
         cfg = self.cfg
         assert self.env is not None, "Trainer.run requires build_env=True"
         
-        ep_return = 0.0
-        ep_len = 0
+        N = self.num_envs  # number of parallel envs
+        ep_returns = np.zeros(N, dtype=np.float64)
+        ep_lens    = np.zeros(N, dtype=np.int64)
         ep_count = 0
-        recent_returns = deque(maxlen=20)   # adjust to 100 later if you want
+        recent_returns = deque(maxlen=20)
         recent_lens = deque(maxlen=20)
         log_ep_every = int(getattr(cfg.training, "log_episode_every", 10))
 
@@ -223,6 +235,8 @@ class Trainer:
 
         obs, _ = self.env.reset(seed=int(cfg.seed) + self.state.env_step)
         obs = np.asarray(obs, dtype=np.float32)
+        if N == 1:
+            obs = obs[np.newaxis]  # [1, obs_dim] — unify shape for single env
 
         self.best_eval_return = self.evaluate_deterministic(eval_episodes)
         self.best_train_return = -1e9  # Track best training performance
@@ -230,100 +244,100 @@ class Trainer:
         train_best_min_delta = float(getattr(cfg.training, "train_best_min_delta", 1.0))  # Minimum improvement to save
 
         t0 = time.time()
+        eval_time_total = 0.0  # cumulative seconds spent in evaluate_deterministic; excluded from FPS
         while self.state.env_step < end_step:
-            # Collect transition(s)
+            # Collect transition(s) — vectorized over N parallel envs.
+            # obs shape: [N, obs_dim]; VectorEnv auto-resets on episode end.
+            act_dim = (self.env.single_action_space if N > 1 else self.env.action_space).shape[0]
             for _ in range(int(cfg.training.collect_per_step)):
-                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)  # [N, obs_dim]
                 if self.state.env_step < int(cfg.training.start_learning):
-                    act_dim = self.env.unwrapped.action_space.shape[0]
-                    action = np.random.uniform(-1.0, 1.0, size=(act_dim,)).astype(np.float32)
+                    action = np.random.uniform(-1.0, 1.0, size=(N, act_dim)).astype(np.float32)
                 else:
                     with torch.no_grad():
                         action_t = self.agent.act_stochastic_from_obs(obs_t, self.world_model_ensemble, device=self.device)
-                    action = action_t.squeeze(0).cpu().numpy().astype(np.float32)
+                    action = action_t.float().cpu().numpy().astype(np.float32)  # [N, act_dim]
 
-                next_obs, reward, done, trunc, _ = self.env.step(action)
+                if N > 1:
+                    next_obs, rewards, dones, truncs, _ = self.env.step(action)
+                else:
+                    next_obs, rewards, dones, truncs, _ = self.env.step(action[0])
+                    next_obs = np.asarray(next_obs, dtype=np.float32)[np.newaxis]
+                    rewards  = np.asarray([rewards], dtype=np.float64)
+                    dones    = np.asarray([dones])
+                    truncs   = np.asarray([truncs])
+
                 next_obs = np.asarray(next_obs, dtype=np.float32)
 
-                terminated = bool(done)
-                truncated = bool(trunc)
-                is_last = bool(terminated or truncated)
+                for i in range(N):
+                    terminated_i = bool(dones[i])
+                    truncated_i  = bool(truncs[i])
+                    self.replay.add(obs[i], action[i], float(rewards[i]),
+                                    terminated_i, truncated_i, next_obs[i])
+                    ep_returns[i] += float(rewards[i])
+                    ep_lens[i]    += 1
 
-                self.replay.add(obs, action, float(reward), terminated, truncated, next_obs)
-                
-                ep_return +=float(reward)
-                ep_len +=1
+                    if terminated_i or truncated_i:
+                        ep_count += 1
+                        recent_returns.append(float(ep_returns[i]))
+                        recent_lens.append(int(ep_lens[i]))
+
+                        if (ep_count % log_ep_every) == 0:
+                            self.tb.scalar("train/episode_return", ep_returns[i], self.state.env_step)
+                            self.tb.scalar("train/episode_length", ep_lens[i], self.state.env_step)
+                            self.tb.scalar("train/return_mean_20", float(np.mean(recent_returns)), self.state.env_step)
+                            self.tb.scalar("train/len_mean_20", float(np.mean(recent_lens)), self.state.env_step)
+                            self.tb.scalar("train/episodes", ep_count, self.state.env_step)
+
+                        # Save best training checkpoint based on recent performance
+                        if save_best_train and len(recent_returns) >= 5 and self.state.env_step >= int(cfg.training.start_learning):
+                            mean_train_ret = float(np.mean(recent_returns))
+                            if mean_train_ret > (self.best_train_return + train_best_min_delta):
+                                self.best_train_return = mean_train_ret
+                                ckpt = self.checkpointer.make_weights_checkpoint(self)
+                                self.checkpointer.save(ckpt, tag="best_train", make_latest=False)
+                                self.tb.scalar("train/best_return", self.best_train_return, self.state.env_step)
+                                print(f"[BEST_TRAIN] New best training return: {self.best_train_return:.2f} at step {self.state.env_step}")
+                                train_bad_streak = 0
+
+                            # Training-based early rollback detection
+                            if train_rollback_check and self.best_train_return > -1e8 and self.state.env_step >= min_steps_before_rollback:
+                                if mean_train_ret < (self.best_train_return - train_rollback_drop):
+                                    train_bad_streak += 1
+                                    self.tb.scalar("train/bad_streak", float(train_bad_streak), self.state.env_step)
+
+                                    if train_bad_streak >= train_rollback_patience:
+                                        best_train_path = os.path.join(self.checkpointer.ckpt_dir, "best_train.pt")
+                                        if os.path.exists(best_train_path):
+                                            rollback_noise = float(getattr(cfg.training, "rollback_noise_scale", 0.01))
+                                            ckpt = torch.load(best_train_path, map_location=self.device, weights_only=False)
+                                            current_step = self.state.env_step
+                                            ckpt_step = ckpt["state"]["env_step"]
+                                            self.checkpointer.load_into(
+                                                self, ckpt,
+                                                restore_step=False,
+                                                restore_optimizer=False,
+                                                restore_replay=False,
+                                                noise_scale=rollback_noise
+                                            )
+                                            if rollback_lr_scale != 1.0:
+                                                for pg in self.actor_opt.param_groups:
+                                                    pg["lr"] *= rollback_lr_scale
+                                            train_bad_streak = 0
+                                            print(f"[TRAIN_ROLLBACK] step={current_step}, loaded best_train from step={ckpt_step}, "
+                                                  f"train_return dropped from {self.best_train_return:.2f} to {mean_train_ret:.2f}")
+                                            self.tb.scalar("train/rollback", 1.0, self.state.env_step)
+                                            self.tb.scalar("train/rollback_from_step", float(ckpt_step), self.state.env_step)
+                                else:
+                                    if train_bad_streak > 0:
+                                        train_bad_streak = max(0, train_bad_streak - 1)
+
+                        ep_returns[i] = 0.0
+                        ep_lens[i]    = 0
+                        # VectorEnv auto-resets; no manual env.reset() needed.
 
                 obs = next_obs
-                self.state.env_step += 1
-
-                if is_last:
-                    ep_count += 1
-                    recent_returns.append(ep_return)
-                    recent_lens.append(ep_len)
-
-                    if (ep_count % log_ep_every) == 0:
-                        self.tb.scalar("train/episode_return", ep_return, self.state.env_step)
-                        self.tb.scalar("train/episode_length", ep_len, self.state.env_step)
-                        self.tb.scalar("train/return_mean_20", float(np.mean(recent_returns)), self.state.env_step)
-                        self.tb.scalar("train/len_mean_20", float(np.mean(recent_lens)), self.state.env_step)
-                        self.tb.scalar("train/episodes", ep_count, self.state.env_step)
-
-                    # Save best training checkpoint based on recent performance
-                    if save_best_train and len(recent_returns) >= 5 and self.state.env_step >= int(cfg.training.start_learning):
-                        mean_train_ret = float(np.mean(recent_returns))
-                        if mean_train_ret > (self.best_train_return + train_best_min_delta):
-                            self.best_train_return = mean_train_ret
-                            ckpt = self.checkpointer.make_weights_checkpoint(self)
-                            self.checkpointer.save(ckpt, tag="best_train", make_latest=False)
-                            self.tb.scalar("train/best_return", self.best_train_return, self.state.env_step)
-                            print(f"[BEST_TRAIN] New best training return: {self.best_train_return:.2f} at step {self.state.env_step}")
-                            train_bad_streak = 0  # Reset bad streak on improvement
-
-                        # Training-based early rollback detection
-                        if train_rollback_check and self.best_train_return > -1e8 and self.state.env_step >= min_steps_before_rollback:
-                            if mean_train_ret < (self.best_train_return - train_rollback_drop):
-                                train_bad_streak += 1
-                                self.tb.scalar("train/bad_streak", float(train_bad_streak), self.state.env_step)
-
-                                # Trigger immediate rollback if patience exceeded
-                                if train_bad_streak >= train_rollback_patience:
-                                    best_train_path = os.path.join(self.checkpointer.ckpt_dir, "best_train.pt")
-                                    if os.path.exists(best_train_path):
-                                        rollback_noise = float(getattr(cfg.training, "rollback_noise_scale", 0.01))
-                                        ckpt = torch.load(best_train_path, map_location=self.device, weights_only=False)
-                                        current_step = self.state.env_step
-                                        ckpt_step = ckpt["state"]["env_step"]
-
-                                        # Load weights but keep current step/optimizer/replay
-                                        self.checkpointer.load_into(
-                                            self, ckpt,
-                                            restore_step=False,
-                                            restore_optimizer=False,
-                                            restore_replay=False,
-                                            noise_scale=rollback_noise
-                                        )
-
-                                        # Optional: reduce actor lr
-                                        if rollback_lr_scale != 1.0:
-                                            for pg in self.actor_opt.param_groups:
-                                                pg["lr"] *= rollback_lr_scale
-
-                                        train_bad_streak = 0
-                                        print(f"[TRAIN_ROLLBACK] step={current_step}, loaded best_train from step={ckpt_step}, "
-                                              f"train_return dropped from {self.best_train_return:.2f} to {mean_train_ret:.2f}")
-                                        self.tb.scalar("train/rollback", 1.0, self.state.env_step)
-                                        self.tb.scalar("train/rollback_from_step", float(ckpt_step), self.state.env_step)
-                            else:
-                                # Performance recovered, reset streak
-                                if train_bad_streak > 0:
-                                    train_bad_streak = max(0, train_bad_streak - 1)
-
-                    ep_return = 0.0
-                    ep_len = 0
-
-                    obs, _ = self.env.reset(seed=int(cfg.seed) + self.state.env_step)
-                    obs = np.asarray(obs, dtype=np.float32)
+                self.state.env_step += N
 
                 if self.state.env_step >= end_step:
                     break
@@ -336,7 +350,7 @@ class Trainer:
                 and (self.state.env_step % update_every == 0)
                 ):
                 for _ in range(int(cfg.training.updates_per_step)):
-                    wm_loss, kl_loss, obs_loss, rew_loss = self.update_world_model()
+                    wm_loss, kl_loss, obs_loss, rew_loss, sigreg_loss = self.update_world_model()
 
                     if self.state.env_step >= cfg.training.actor_start_step:
                         actor_loss, critic_loss, horizon_used, unc_mean = self.update_actor_critic()
@@ -348,12 +362,16 @@ class Trainer:
 
                     # logging
                     if self.state.env_step % int(cfg.training.log_every_steps) == 0:
-                        fps = (self.state.env_step - start_step) / max(1e-6, (time.time() - t0))
+                        # Exclude eval time from FPS so the metric reflects true training throughput,
+                        # not the growing cost of eval episodes as the agent improves.
+                        train_time = max(1e-6, (time.time() - t0) - eval_time_total)
+                        fps = (self.state.env_step - start_step) / train_time
                         self.tb.scalar("perf/fps", fps, self.state.env_step)
                         self.tb.scalar("loss/world_model", wm_loss, self.state.env_step)
                         self.tb.scalar("loss/kl", kl_loss, self.state.env_step)
                         self.tb.scalar("loss/obs", obs_loss, self.state.env_step)
                         self.tb.scalar("loss/reward", rew_loss, self.state.env_step)
+                        self.tb.scalar("loss/sigreg", sigreg_loss, self.state.env_step)
                         self.tb.scalar("loss/actor", actor_loss, self.state.env_step)
                         self.tb.scalar("loss/critic", critic_loss, self.state.env_step)
                         self.tb.scalar("imagination/horizon_used", horizon_used, self.state.env_step)
@@ -378,9 +396,12 @@ class Trainer:
                 self.save_checkpoint(tag=f"step_{self.state.env_step}")
 
             if eval_every > 0 and (self.state.env_step % eval_every == 0) and (self.state.env_step >= int(cfg.training.start_learning)):
+                _eval_t0 = time.time()
                 mean_ret = self.evaluate_deterministic(eval_episodes)
+                eval_time_total += time.time() - _eval_t0
                 self.tb.scalar("eval/return_mean", mean_ret, self.state.env_step)
                 self.tb.scalar("eval/best_return", self.best_eval_return, self.state.env_step)
+                self.tb.scalar("perf/eval_time_s", eval_time_total, self.state.env_step)
 
                 # Save best
                 if mean_ret > (self.best_eval_return + best_min_delta):
@@ -460,8 +481,9 @@ class Trainer:
         kl_beta = float(cfg.world_model.kl_beta)
         kl_balance = float(getattr(cfg.world_model, "kl_balance", 0.8))
         free_nats = float(getattr(cfg.world_model, "free_nats", 1.0))
+        sigreg_weight = float(getattr(cfg.world_model, "sigreg_weight", 0.0))
 
-        wm_losses, kl_losses, obs_losses, rew_losses, done_losses = [], [], [], [], []
+        wm_losses, kl_losses, obs_losses, rew_losses, done_losses, sigreg_losses = [], [], [], [], [], []
 
         self.wm_opt.zero_grad(set_to_none=True)
         
@@ -510,7 +532,10 @@ class Trainer:
                 )
 
                 # KL across time, mean over batch/time.
-                # FIX: free bits applied per-dimension before summing (DreamerV3 Appendix B).
+                # Free bits applied to the TOTAL KL (sum over latent dims), not per-dimension.
+                # Per-dimension clamping with free_nats=1.0 and latent_dim=64 gives a 64-nat
+                # floor — all dims stay clamped, gradients are zero, posterior collapses.
+                # DreamerV3 convention: max(KL_sum, free_nats) keeps exactly 1 nat of slack.
                 kls = []
                 for t in range(len(post_dists)):
                     q = post_dists[t]
@@ -522,11 +547,21 @@ class Trainer:
                     kl_lhs_per_dim = _kl_per_dim(q_sg, pg)
                     kl_rhs_per_dim = _kl_per_dim(qg,   p_sg)
                     kl_per_dim = kl_balance * kl_lhs_per_dim + (1.0 - kl_balance) * kl_rhs_per_dim
-                    kl_t = torch.clamp(kl_per_dim, min=free_nats).sum(dim=-1)
+                    kl_t = torch.clamp(kl_per_dim.sum(dim=-1), min=free_nats)  # total cap
                     kls.append(kl_t)
                 kl = torch.stack(kls, dim=1).mean()
 
                 loss = obs_loss + rew_loss + done_loss + kl_beta * kl
+
+                # SIGReg: push posterior z marginal toward N(0,I).
+                # Collect z samples from all time steps: list of [B, latent_dim] → [B*T, latent_dim]
+                if sigreg_weight > 0.0:
+                    z_all = torch.stack([s.z for s in states], dim=1).reshape(-1, states[0].z.shape[-1])
+                    sigreg_loss = self.sigreg(z_all)
+                    loss = loss + sigreg_weight * sigreg_loss
+                else:
+                    sigreg_loss = torch.zeros(1, device=self.device)
+
             loss.backward()
 
             wm_losses.append(loss.detach().item())
@@ -534,11 +569,18 @@ class Trainer:
             obs_losses.append(obs_loss.detach().item())
             rew_losses.append(rew_loss.detach().item())
             done_losses.append(done_loss.detach().item())
+            sigreg_losses.append(sigreg_loss.detach().item())
 
         torch.nn.utils.clip_grad_norm_(self.world_model_ensemble.parameters(), float(cfg.world_model.grad_clip))
         self.wm_opt.step()
 
-        return float(np.mean(wm_losses)), float(np.mean(kl_losses)), float(np.mean(obs_losses)), float(np.mean(rew_losses))
+        return (
+            float(np.mean(wm_losses)),
+            float(np.mean(kl_losses)),
+            float(np.mean(obs_losses)),
+            float(np.mean(rew_losses)),
+            float(np.mean(sigreg_losses)),
+        )
 
 
     def _choose_horizon(self, obs0: torch.Tensor, act0: torch.Tensor) -> Tuple[int, float]:
@@ -742,6 +784,7 @@ class Trainer:
             self.actor_opt.step()
             
         finally:
+            wm.train()
             for p, req in zip(wm.parameters(), _prev_req):
                 p.requires_grad_(req)
     

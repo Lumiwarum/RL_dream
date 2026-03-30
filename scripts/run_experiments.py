@@ -112,13 +112,49 @@ ADAPTIVE_OVERRIDES_PER_ENV = {
 }
 
 SHARED_TRAINING_OVERRIDES = [
-    "training.total_steps=1000000",
-    "training.steps_per_chunk=200000",
+    # ── Steps ───────────────────────────────────────────────────────────────────
+    # 300k pilot: verify learning curves before committing to longer runs.
+    # Hopper converges by ~250k; Walker2d shows a clear trend by 300k.
+    # Bump to 500k / 1M after reviewing pilot results.
+    "training.total_steps=300000",
+    "training.steps_per_chunk=300000",  # must match total_steps (single-subprocess design)
+
+    # ── Env collection ──────────────────────────────────────────────────────────
+    "env.num_envs=8",
+
+    # ── Learning schedule ───────────────────────────────────────────────────────
     "training.start_learning=5000",
     "training.checkpoint_every_steps=10000",
     "training.log_every_steps=2000",
-    "training.eval_every_steps=2000",
+
+    # ── Eval ────────────────────────────────────────────────────────────────────
+    # Less frequent eval reduces the growing overhead as episodes get longer.
+    # At 300k steps and ~80 FPS: eval fires ~30 times total (every 10k steps).
+    "training.eval_every_steps=10000",
     "training.eval_episodes=5",
+    "training.eval_max_episode_steps=1000",
+
+    # ── Update ratio ────────────────────────────────────────────────────────────
+    # Keep updates_per_step FIXED regardless of num_envs.
+    # Scaling it with N gives the same FPS (GPU stays bottleneck); keeping it fixed
+    # means N=8 collects 2x transitions per GPU update → ~2x FPS vs N=4.
+    "training.updates_per_step=4",
+
+    # ── Network size ────────────────────────────────────────────────────────────
+    # 512/256 are DreamerV3 image-scale sizes. For state-vector tasks (Hopper=11-dim,
+    # Walker2d=17-dim), 256/128 gives ~3x faster updates with no quality loss.
+    "world_model.hidden_dim=256",
+    "world_model.deter_dim=128",
+    "agent.actor_hidden=256",
+    "agent.critic_hidden=256",
+
+    # ── World model loss ─────────────────────────────────────────────────────────
+    # free_nats=1.0 is a TOTAL KL floor (max(KL_sum, 1)), NOT per-dimension.
+    # kl_beta=0.5 gives obs reconstruction more weight relative to KL.
+    # sigreg_weight=0.01 prevents SIGReg from fighting the posterior encoding info.
+    "world_model.free_nats=1.0",
+    "world_model.kl_beta=0.5",
+    "world_model.sigreg_weight=0.01",
 ]
 
 
@@ -188,7 +224,7 @@ def make_ablation_ensemble_experiments() -> List[Experiment]:
                                   "imagination.horizons=[5,10,20]", "world_model.ensemble_size=3"]),
     ]
     exps = []
-    for n, method, overrides in configs:
+    for _n, method, overrides in configs:
         for seed in SEEDS:
             exps.append(Experiment(
                 group="ablation_ensemble",
@@ -457,6 +493,12 @@ def parse_args():
         help="Skip experiments that are already marked 'done' in the manifest.",
     )
     p.add_argument(
+        "--reset", action="store_true",
+        help="Reset all experiments in the selected group back to 'pending' in the manifest, "
+             "then run them. Use this when you want to re-run from scratch after deleting runs. "
+             "Experiments outside the selected group are NOT affected.",
+    )
+    p.add_argument(
         "--list", action="store_true",
         help="List all experiments in the selected group and exit.",
     )
@@ -494,8 +536,22 @@ def main():
 
     manifest = load_manifest()
 
+    # --reset: mark every experiment in the current group back to pending so they re-run.
+    # Experiments from other groups remain untouched.
+    if args.reset:
+        reset_names = [exp.exp_name for exp in experiments]
+        n_reset = sum(1 for n in reset_names if manifest.get(n, {}).get("status") in ("done", "failed"))
+        if n_reset:
+            print(f"[RESET] resetting {n_reset} done/failed experiment(s) to pending "
+                  f"for group '{args.group}'.")
+            for name in reset_names:
+                if name in manifest:
+                    manifest[name]["status"] = "pending"
+        else:
+            print(f"[RESET] no done/failed experiments found for group '{args.group}'; nothing to reset.")
+
     # Reset any "running" entries to "pending" — they were interrupted (crash / Ctrl+C)
-    # and must be retried. "done" entries are never touched.
+    # and must be retried. "done" entries are never touched (unless --reset was passed above).
     stale = [name for name, row in manifest.items() if row.get("status") == "running"]
     if stale:
         print(f"[CLEANUP] {len(stale)} interrupted run(s) reset to pending: {', '.join(stale)}")
