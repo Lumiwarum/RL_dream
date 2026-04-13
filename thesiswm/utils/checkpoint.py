@@ -33,6 +33,7 @@ class Checkpointer:
             "replay": trainer.replay.state_dict(),
             "world_model": trainer.world_model_ensemble.state_dict(),
             "agent": trainer.agent.state_dict(),
+            "target_critic": trainer.target_critic.state_dict(),
             "opt": {
                 "wm_opt": trainer.wm_opt.state_dict(),
                 "actor_opt": trainer.actor_opt.state_dict(),
@@ -55,6 +56,7 @@ class Checkpointer:
             },
             "world_model": trainer.world_model_ensemble.state_dict(),
             "agent": trainer.agent.state_dict(),
+            "target_critic": trainer.target_critic.state_dict(),
             "metrics": {
                 "best_eval_return":  float(getattr(trainer, "best_eval_return",  -1e9)),
                 "best_train_return": float(getattr(trainer, "best_train_return", -1e9)),
@@ -95,6 +97,11 @@ class Checkpointer:
 
         trainer.world_model_ensemble.load_state_dict(ckpt["world_model"])
         trainer.agent.load_state_dict(ckpt["agent"])
+        if "target_critic" in ckpt:
+            trainer.target_critic.load_state_dict(ckpt["target_critic"])
+        else:
+            # Older checkpoint: initialize target as copy of live critic.
+            trainer.target_critic.load_state_dict(trainer.agent.critic.state_dict())
 
         # Add noise to weights if requested (helps avoid repeating same divergence)
         if noise_scale > 0.0:

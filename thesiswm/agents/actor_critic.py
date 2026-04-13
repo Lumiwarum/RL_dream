@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
-
 import math
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from thesiswm.models.networks import MLP
-from thesiswm.models.rssm import EnsembleWorldModel, RSSMState
+
+_LOG_2PI = math.log(2.0 * math.pi)
 
 
 class TanhGaussianPolicy(nn.Module):
@@ -25,7 +24,13 @@ class TanhGaussianPolicy(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         params = self.net(x)
         mean, log_std = torch.chunk(params, 2, dim=-1)
-        log_std = torch.clamp(log_std, -5.0, 2.0)
+        # Tanh bounds mean to (-1,1): prevents unbounded MLP output that saturates the
+        # outer tanh in sample() and zeroes out the pathwise gradient.
+        mean = torch.tanh(mean)
+        # std ∈ [exp(-1), exp(0)] = [0.37, 1.00].
+        # Floor: prevents collapse. Ceiling: keeps pre-tanh samples in (-3,+3) where
+        # the tanh Jacobian ≥ 0.09, preserving non-zero pathwise gradient.
+        log_std = torch.clamp(log_std, -1.0, 0.0)
         return mean, log_std
 
     def sample(self, x: torch.Tensor):
@@ -34,29 +39,29 @@ class TanhGaussianPolicy(nn.Module):
         eps = torch.randn_like(std)
         pre_tanh = mean + eps * std
         action = torch.tanh(pre_tanh)
-
-        # log_prob with tanh correction
-        # Use math.pi for precision and clamp action to prevent boundary issues
         log_prob = -0.5 * (
             ((pre_tanh - mean) / (std + 1e-8)) ** 2
             + 2 * log_std
-            + torch.log(torch.tensor(2.0 * math.pi, device=x.device, dtype=std.dtype))
+            + _LOG_2PI
         ).sum(dim=-1)
-
-        # Jacobian correction for tanh squashing: log|d(tanh(u))/du| = log(1 - tanh²(u))
-        # Use epsilon inside the log (not clamp) so gradient flows correctly for saturated actions.
+        # Tanh Jacobian correction: log|d(tanh(u))/du| = log(1 - tanh²(u))
         log_prob = log_prob - torch.log(1.0 - action.pow(2) + 1e-6).sum(dim=-1)
         return action, log_prob
 
     def mean_action(self, x: torch.Tensor) -> torch.Tensor:
         mean, _ = self.forward(x)
-        return torch.tanh(mean)
+        return mean  # forward() already applies tanh
 
 
 class ValueNet(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int):
         super().__init__()
         self.net = MLP(in_dim, 1, hidden_dim=hidden_dim, num_layers=2)
+        # Near-zero output init: with symlog critic, symexp(~0)=0 at startup so the baseline
+        # stays ≈0 until the critic has seen data. Without this, random MLP outputs of ±15
+        # map through symexp to ±3e6, causing advantage explosion in the first few batches.
+        nn.init.constant_(self.net.net[-1].bias, 0.0)
+        nn.init.uniform_(self.net.net[-1].weight, -0.01, 0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
@@ -71,37 +76,3 @@ class ActorCritic(nn.Module):
         self.actor = TanhGaussianPolicy(feat_dim, act_dim, actor_hidden)
         self.critic = ValueNet(feat_dim, critic_hidden)
 
-    @torch.no_grad()
-    def act_deterministic_from_obs(
-        self,
-        obs: torch.Tensor,  # [B, obs_dim]
-        ensemble: EnsembleWorldModel,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        Deterministic evaluation action using model[0] posterior features from the single-step obs.
-        """
-        wm0 = ensemble.models[0]
-        obs_seq = obs.unsqueeze(1)
-        # dummy action (zeros) to update GRU once; we only need a feature embedding from obs.
-        act_dim = wm0.rssm.act_dim
-        act_seq = torch.zeros((obs.shape[0], 1, act_dim), device=device)
-        states, post, prior = wm0.rssm.observe_sequence(obs_seq, act_seq, device=device, sample=False)
-        feat = wm0.features(states[-1])
-        return self.actor.mean_action(feat)
-
-    @torch.no_grad()
-    def act_stochastic_from_obs(
-        self,
-        obs: torch.Tensor,
-        ensemble: EnsembleWorldModel,
-        device: torch.device,
-    ) -> torch.Tensor:
-        wm0 = ensemble.models[0]
-        obs_seq = obs.unsqueeze(1)
-        act_dim = wm0.rssm.act_dim
-        act_seq = torch.zeros((obs.shape[0], 1, act_dim), device=device)
-        states, _, _ = wm0.rssm.observe_sequence(obs_seq, act_seq, device=device, sample=True)
-        feat = wm0.features(states[-1])
-        a, _ = self.actor.sample(feat)
-        return a

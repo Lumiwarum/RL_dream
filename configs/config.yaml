@@ -27,17 +27,39 @@ world_model:
   kl_beta: 0.5         # gentler KL penalty; obs reconstruction gets more relative weight
   free_nats: 1.0       # total KL floor (not per-dim); applied as max(KL_sum, free_nats)
   sigreg_weight: 0.01  # was 0.1; large values fight the posterior encoding information
+  # cont head: weight 0.5 prevents BCE from dominating obs/rew early; floor 0.9 ensures the
+  # imagination discount never collapses below 0.99*0.9=0.891/step even with a pessimistic WM.
+  cont_loss_weight: 0.5
+  cont_disc_floor: 0.9
   lr: 3e-4
   grad_clip: 100.0
 
 agent:
   actor_hidden: 256
   critic_hidden: 256
-  actor_lr: 3e-4
-  critic_lr: 3e-4
-  entropy_coef: 1e-3
+  actor_lr: 3e-5    # low LR prevents rapid drift to saturation boundary
+  critic_lr: 3e-5   # matches DreamerV3; slower critic warmup prevents divergence driving SPIKE_THEN_DROP
+  entropy_coef: 3e-4  # DreamerV3 level; 1e-2 was 100x too high → entropy dominated actor loss early,
+                      # freezing policy at std=1.0 then causing sudden collapse when return gradient grew
+  pretanh_reg_coef: 1e-3  # penalises large |mean| pre-tanh directly; prevents vanishing gradients
   discount: 0.99
   lambda_: 0.95
+  # Symlog critic (DreamerV3 §A.2): train critic to predict symlog(V) instead of V directly.
+  # Bootstrap values are converted back via symexp before lambda-return computation.
+  # This breaks the V↑→target↑→V loop that blows up H=5/H=15: symlog(500)≈6.2 so the
+  # critic never needs to output large values even when returns are large.
+  symlog_critic: true
+  # Clamp symlog-space critic outputs before symexp conversion.
+  # symexp(5)=147: with H=20, γ=0.99, cont=0.99 the maximum bootstrap
+  # contribution is 0.82×0.82×147≈99, so target_actor ≤ ~130-150.
+  # symexp(7)=1096 (old): bootstrap≈737 → rscale→1000 → actor_grad≈0.001
+  # (ACTOR_GRAD_TINY death spiral). Reducing to 5.0 keeps rscale in [30,100]
+  # which is sufficient for the actor to learn. Once eval>1000 we can raise it.
+  symlog_clamp: 5.0
+  # Hard cap on the advantage normalisation scale.
+  # 1000 was too high — even with the p95-p5 fix, rscale can saturate at 1000
+  # when the critic reaches the symlog clamp. 100 forces gradients to stay sane.
+  return_scale_max: 100.0
 
 method:
   name: "fixed_h20"  # fixed_h5 | fixed_h15 | fixed_h20 | adaptive_5_10_20

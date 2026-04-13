@@ -123,22 +123,42 @@ class ReplayBuffer:
 
         # --- Vectorized valid-start selection ---
         # Generate a large pool, check all boundaries at once, take first B valid.
-        pool_size = min(B * 16, upper)
+        pool_size = min(B * 16, max(upper, 1))
         candidates = np.random.randint(0, upper, size=pool_size)
 
-        # Boundary check: is_last[s : s+T-1] must be all zeros.
+        # Boundary check 1: episode boundary — is_last[s : s+T-1] must be all zeros.
         # Shape: [pool_size, T-1] — single numpy fancy-index, no Python loop.
         win_idx = candidates[:, None] + np.arange(T - 1)[None, :]   # [P, T-1]
         has_boundary = self.is_last[win_idx].any(axis=1)              # [P]
-        valid = candidates[~has_boundary]
+
+        # Boundary check 2: ring-buffer wrap — when full, a sequence starting in
+        # [idx-T+1, idx-1] would straddle the write pointer, mixing data from different
+        # episodes that happen to be stored adjacently by accident.
+        crosses_wrap = np.zeros(pool_size, dtype=bool)
+        if self.full and self.idx > 0:
+            # Forbidden: s in (idx-T, idx) → sequence [s, s+T-1] crosses pointer idx-1→idx
+            lo = max(0, self.idx - T + 1)
+            hi = self.idx  # exclusive
+            crosses_wrap = (candidates >= lo) & (candidates < hi)
+
+        valid = candidates[~has_boundary & ~crosses_wrap]
 
         if len(valid) >= B:
             starts = valid[:B]
         else:
-            # Not enough clean sequences — top up with possibly boundary-crossing ones.
-            shortfall = B - len(valid)
-            extra = np.random.randint(0, upper, size=(shortfall,))
-            starts = np.concatenate([valid, extra])
+            # Not enough clean sequences — resample until we have enough.
+            # Avoids silently returning boundary-crossing sequences.
+            rng_attempts = 0
+            while len(valid) < B and rng_attempts < 20:
+                extra_cands = np.random.randint(0, upper, size=pool_size)
+                win_extra = extra_cands[:, None] + np.arange(T - 1)[None, :]
+                hb_extra = self.is_last[win_extra].any(axis=1)
+                cw_extra = np.zeros(pool_size, dtype=bool)
+                if self.full and self.idx > 0:
+                    cw_extra = (extra_cands >= lo) & (extra_cands < hi)
+                valid = np.concatenate([valid, extra_cands[~hb_extra & ~cw_extra]])
+                rng_attempts += 1
+            starts = valid[:B] if len(valid) >= B else valid  # use what we have
 
         # --- Vectorized gather: one numpy fancy-index call per field ---
         idxs = starts[:, None] + np.arange(T)[None, :]  # [B, T]

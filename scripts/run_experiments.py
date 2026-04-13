@@ -67,15 +67,18 @@ class Experiment:
     def exp_name(self) -> str:
         """Unique name used for run_dir and manifest."""
         env_tag = self.env_id.replace("-", "").lower()
+        # Only include overrides that add information not already in the method name.
+        # horizon_fixed is redundant (method=fixed_h15 already encodes it); skip it.
+        # metric/ensemble/thresh are ablation-specific and always included.
         overrides_tag = "_".join(
             o.replace("=", "-").replace(".", "_").replace("/", "-")
             for o in self.extra_overrides
-            if any(k in o for k in ["metric", "ensemble", "thresh", "horizon_fixed"])
+            if any(k in o for k in ["metric", "ensemble", "thresh"])
         )
         tag = f"{env_tag}_{self.method}"
         if overrides_tag:
             tag += f"_{overrides_tag}"
-        tag += f"_seed{self.seed}"
+        tag += f"_s{self.seed}"   # shorter: s0 not seed0
         return tag
 
     def build_cmd(self) -> List[str]:
@@ -103,11 +106,31 @@ FIXED_VARIANTS = {
 }
 
 ADAPTIVE_OVERRIDES_PER_ENV = {
-    "Hopper-v4":   ["method.uncertainty_metric=next_obs_mean_l2",
-                    "method.thresh_high=0.30", "method.thresh_mid=0.12",
+    # Use latent_mean_l2 (not next_obs_mean_l2): next_obs_mean_l2 operates in raw
+    # observation space where Hopper L2 distances are O(4-5), making thresholds like
+    # 0.30 impossibly tight → adaptive always selects H_min.
+    # latent_mean_l2 operates in z-space (64-dim, z≈N(0,I)), where disagreement is
+    # O(0.5-3.0) between ensemble members, matching these thresholds.
+    # Empirical calibration from first pilot (300k steps, trained ensemble):
+    # latent_mean_l2 for trained models = 0.33-0.78 (much less than random-init ≈11.3
+    # because both ensemble members converge to similar representations).
+    # Observed range from pilot report (report_20260412):
+    #   Hopper:   med=0.37–0.72,  p95=0.42–0.78
+    #   Walker2d: med=0.62–1.79,  p95=0.66–1.85  ← much wider than Hopper
+    # Hopper: thresholds at ~p75 and ~p50 of [0.44, 0.75]
+    #   uncertainty > 0.70 → H=5   (high disagreement → short, safe horizon)
+    #   uncertainty > 0.55 → H=10  (medium disagreement)
+    #   else               → H=20  (low disagreement → long horizon)
+    # Walker2d: thresholds recalibrated for wider uncertainty range [0.62, 1.79]
+    # at ~p75 and ~p40 so all three horizons get used:
+    #   uncertainty > 1.50 → H=5
+    #   uncertainty > 0.80 → H=10
+    #   else               → H=20
+    "Hopper-v4":   ["method.uncertainty_metric=latent_mean_l2",
+                    "method.thresh_high=0.70", "method.thresh_mid=0.55",
                     "imagination.horizons=[5,10,20]"],
-    "Walker2d-v4": ["method.uncertainty_metric=next_obs_mean_l2",
-                    "method.thresh_high=0.35", "method.thresh_mid=0.15",
+    "Walker2d-v4": ["method.uncertainty_metric=latent_mean_l2",
+                    "method.thresh_high=1.50", "method.thresh_mid=0.80",
                     "imagination.horizons=[5,10,20]"],
 }
 
@@ -124,6 +147,14 @@ SHARED_TRAINING_OVERRIDES = [
 
     # ── Learning schedule ───────────────────────────────────────────────────────
     "training.start_learning=5000",
+    # actor_start_step > start_learning: let the world model train for 15k steps
+    # before the actor/critic touch it. At 5k steps the replay is full of random-
+    # policy data where Hopper falls in <50 steps → cont_prob≈0.6, reward predictions
+    # noisy. Starting AC at 20k gives the WM 15k gradient steps to learn episode
+    # structure (cont, reward) before bootstrap values enter lambda-return targets.
+    # Without this, the critic receives targets dominated by a bad bootstrap and can
+    # spiral: over-estimated V → large advantage std → rscale grows → actor stops.
+    "training.actor_start_step=20000",
     "training.checkpoint_every_steps=10000",
     "training.log_every_steps=2000",
 
@@ -155,6 +186,35 @@ SHARED_TRAINING_OVERRIDES = [
     "world_model.free_nats=1.0",
     "world_model.kl_beta=0.5",
     "world_model.sigreg_weight=0.01",
+
+    # ── Actor-critic ─────────────────────────────────────────────────────────────
+    # actor_lr=1e-4: raised from 3e-5 — with entropy+pretanh_reg preventing saturation,
+    #   the conservative 3e-5 was leaving actor_grad_norm at ~0.02 (barely learning).
+    #   Matching critic_lr=1e-4 gives better actor-critic balance.
+    # entropy_coef=1e-2: Gaussian (pre-tanh) entropy — always positive, correct gradient direction.
+    #   The log_prob-based entropy goes negative when |tanh(mean)|→1, causing entropy term to
+    #   PENALISE instead of rewarding diversity. Gaussian entropy never has this problem.
+    #   Previously broken (no_grad caching bug gave zero gradient); now works correctly.
+    #   log_std ceiling at +0.5 (actor_critic.py) prevents entropic explosion if this is still
+    #   too strong; floor at -1.0 prevents collapse if this is too weak.
+    # pretanh_reg_coef=1e-3: L2 penalty on raw pre-tanh MLP output (recovered via atanh);
+    #   prevents the actor from drifting to the tanh saturation boundary.
+    "agent.actor_lr=1e-4",
+    "agent.critic_lr=1e-4",
+    "agent.entropy_coef=1e-2",
+    "agent.pretanh_reg_coef=1e-3",
+
+    # ── Rollback — DISABLED ───────────────────────────────────────────────────────
+    # The rollback mechanism triggered an infinite loop on Hopper:
+    #   train_rollback_drop=20 ≈ natural episode-to-episode variance (sigma≈20 with random policy)
+    #   → bad_streak fires every 2-3 episodes → 528 rollbacks in 50k steps
+    #   → each rollback reloads cont predictor weights from an early checkpoint where p≈0.5
+    #   → cont predictor never converges → discounts stay ≈0.5 → actor can't learn
+    # Disabling until the agent reaches a regime where returns are high and stable enough
+    # for rollback thresholds to be meaningful (well above variance).
+    "training.train_rollback_check=false",
+    "training.rollback_drop=0",          # 0 disables eval rollback (condition: rollback_drop > 0)
+    "training.save_best_train=false",    # no best_train.pt — nothing to roll back to
 ]
 
 
@@ -186,9 +246,22 @@ def make_main_experiments() -> List[Experiment]:
 
 UNCERTAINTY_METRICS = ["latent_mean_l2", "next_obs_mean_l2", "gaussian_kl"]
 
+# Per-metric thresholds calibrated to each metric's natural scale on Hopper.
+# Using identical thresholds across metrics would confound the ablation by
+# effectively selecting different horizons for different metrics unintentionally.
+#   latent_mean_l2:  z-space (N(0,I) prior), disagreement ≈ O(0.5–5)
+#   next_obs_mean_l2: raw obs space (Hopper=11-dim, values O(1–5)), disagreement ≈ O(1–10)
+#   gaussian_kl:      symmetric KL between posteriors, ≈ O(0.1–3)
+METRIC_THRESHOLDS = {
+    "latent_mean_l2":   ("3.0", "1.0"),
+    "next_obs_mean_l2": ("6.0", "2.0"),
+    "gaussian_kl":      ("1.5", "0.5"),
+}
+
 def make_ablation_metric_experiments() -> List[Experiment]:
     exps = []
     for metric in UNCERTAINTY_METRICS:
+        th_high, th_mid = METRIC_THRESHOLDS[metric]
         for seed in SEEDS:
             exps.append(Experiment(
                 group="ablation_metric",
@@ -197,8 +270,8 @@ def make_ablation_metric_experiments() -> List[Experiment]:
                 seed=seed,
                 extra_overrides=[
                     f"method.uncertainty_metric={metric}",
-                    "method.thresh_high=0.30",
-                    "method.thresh_mid=0.12",
+                    f"method.thresh_high={th_high}",
+                    f"method.thresh_mid={th_mid}",
                     "imagination.horizons=[5,10,20]",
                 ] + SHARED_TRAINING_OVERRIDES,
             ))
@@ -216,11 +289,11 @@ def make_ablation_ensemble_experiments() -> List[Experiment]:
     configs = [
         (1, "fixed_h15",      ["imagination.horizon_fixed=15", "world_model.ensemble_size=1"]),
         (2, "fixed_h15",      ["imagination.horizon_fixed=15", "world_model.ensemble_size=2"]),
-        (2, "adaptive_5_10_20", ["method.uncertainty_metric=next_obs_mean_l2",
-                                  "method.thresh_high=0.30", "method.thresh_mid=0.12",
+        (2, "adaptive_5_10_20", ["method.uncertainty_metric=latent_mean_l2",
+                                  "method.thresh_high=3.0", "method.thresh_mid=1.0",
                                   "imagination.horizons=[5,10,20]", "world_model.ensemble_size=2"]),
-        (3, "adaptive_5_10_20", ["method.uncertainty_metric=next_obs_mean_l2",
-                                  "method.thresh_high=0.30", "method.thresh_mid=0.12",
+        (3, "adaptive_5_10_20", ["method.uncertainty_metric=latent_mean_l2",
+                                  "method.thresh_high=3.0", "method.thresh_mid=1.0",
                                   "imagination.horizons=[5,10,20]", "world_model.ensemble_size=3"]),
     ]
     exps = []
@@ -237,12 +310,15 @@ def make_ablation_ensemble_experiments() -> List[Experiment]:
 
 
 # ── ABLATION: THRESHOLD SENSITIVITY ───────────────────────────────────────────
-# Vary (thresh_high, thresh_mid) for Adaptive on Hopper
+# Vary (thresh_high, thresh_mid) for Adaptive on Hopper using latent_mean_l2.
+# latent_mean_l2 operates in z-space (N(0,I)), typical disagreement ≈ O(0.5–5).
+# Previous values (0.20–0.50) were calibrated for next_obs_mean_l2 and would
+# collapse all adaptive runs to H_max when used with latent_mean_l2.
 THRESHOLD_PAIRS = [
-    (0.20, 0.08),
-    (0.30, 0.12),   # default
-    (0.40, 0.16),
-    (0.50, 0.20),
+    (1.5, 0.5),    # tight — selects H_low more often
+    (3.0, 1.0),    # default / calibrated
+    (4.5, 1.5),    # loose
+    (6.0, 2.0),    # very loose — H_high most of the time
 ]
 
 def make_ablation_threshold_experiments() -> List[Experiment]:
@@ -255,7 +331,7 @@ def make_ablation_threshold_experiments() -> List[Experiment]:
                 method="adaptive_5_10_20",
                 seed=seed,
                 extra_overrides=[
-                    "method.uncertainty_metric=next_obs_mean_l2",
+                    "method.uncertainty_metric=latent_mean_l2",
                     f"method.thresh_high={th}",
                     f"method.thresh_mid={tm}",
                     "imagination.horizons=[5,10,20]",
@@ -292,7 +368,8 @@ def load_manifest() -> dict[str, dict]:
         return {}
     rows = {}
     with open(MANIFEST_PATH, newline="") as f:
-        reader = csv.DictReader(f)
+        # Strip NUL bytes produced by partial writes (process killed mid-save).
+        reader = csv.DictReader(line.replace("\x00", "") for line in f)
         for row in reader:
             rows[row["exp_name"]] = row
     return rows

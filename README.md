@@ -1,162 +1,237 @@
-# ThesisWM — DreamerV3-style World Model RL with Adaptive Imagination Horizon (Ensemble)
+# ThesisWM — DreamerV3-style World Model RL with Adaptive Imagination Horizon
 
-This repo is a compact DreamerV3-inspired agent for **robotics RL** (Gymnasium / MuJoCo style state-vector tasks).
-The core idea is to learn a latent dynamics model (RSSM) and train an actor-critic purely from **imagined rollouts**.
+Master thesis project. Core idea: replace DreamerV3's fixed planning horizon with an
+**ensemble-based adaptive horizon** — when the world model ensemble disagrees (high
+uncertainty), use a short rollout (H=5, safer); when it agrees (low uncertainty), use
+a long rollout (H=20, better credit assignment).
 
-## Key idea: Adaptive imagination horizon using an ensemble
-Dreamer typically imagines a fixed horizon (e.g., H=15). Here we keep an **ensemble of world models** and estimate
-**epistemic uncertainty** via **disagreement** between ensemble members. At decision time (during actor/critic updates),
-we choose a horizon:
-- high disagreement → short rollout (safer, less model bias)
-- low disagreement → long rollout (more compute-efficient and better long-term credit assignment)
+---
 
-So the agent can “look ahead longer” only when the model is confident.
+## Current phase: Baseline validation
 
-### Components
-- `rssm.py`: RSSM latent dynamics + prediction heads (obs/reward/continue)
-- `trainer.py`: data collection, world model training, imagined rollouts, actor-critic updates, checkpointing
-- `imagination.py`: lambda-returns + adaptive horizon chooser
-- `actor_critic.py`: tanh-squashed Gaussian policy + value network
-- `replay_buffer.py`: sequence replay buffer (for RSSM training)
-- `eval.py`: evaluate a checkpoint; can record MP4 videos
-- `video.py`: MP4 writer (imageio)
+**Goal**: confirm that `fixed_h20` (the DreamerV3 baseline) learns stably on Hopper and
+Walker2d before running ablations. Only move to the adaptive comparison after the
+baseline curves look clean.
 
-## Install
-Create a venv and install dependencies (typical):
-- torch
-- gymnasium (+ mujoco)
-- hydra-core, omegaconf
-- tensorboard
-- imageio[ffmpeg]
+**Success criteria for a healthy baseline run:**
+- `eval/return_mean` rises consistently (Hopper: >1000 by 200k steps, Walker2d: >800 by 300k)
+- `loss/actor` stays in `[0.001, 2.0]` — never NaN
+- `value/return_scale` stays in `[1, 50]` — never jumps to hundreds
+- `imagine/cont_prob_mean` stays in `[0.7, 0.99]` — never collapses to 0
+- No `VALUE_DIVERGE` or `CONT_LOW` flags in scan_logs
 
-(Exact dependency list depends on your server setup.)
+---
 
-## Useful commands
-### Quickstart: smoke test
-```bash
-python scripts/smoke_test.py
-```
-### Train (example)
-```
-python train.py --config quickstart
-```
-### Resume training
-```
-python train.py --config quickstart --resume
-```
-### Override steps per chunk
-```
-python train.py --config quickstart --steps_per_chunk 30000 --resume
-```
-### Launch tensorboard page
-```
-tensorboard --logdir runs --port 8032
-```
-### Evaluate a checkpoint (print returns)
-```
-python eval.py --config quickstart --checkpoint runs/<exp_name>/checkpoints/latest.pt --episodes 10
-```
-### Record evaluation video (MP4)
-```
-python eval.py --config quickstart \
-  --checkpoint runs/<exp_name>/checkpoints/latest.pt \
-  --episodes 3 --record_video --video_dir runs/<exp_name>/videos
-```
+## Quick reference
 
-### Evaluate video 
-```
-python eval_latest_video.py --config quickstart --run_dir runs/<exp_name> --episodes 5 --device cuda --video_dir runs/<exp_name>/videos_latest
-```
-
-## Experiments
-
-### Experiment groups
-
-| Group | Description | Experiments |
-|---|---|---|
-| `main` | Hopper + Walker2d × {fixed_h5, fixed_h15, fixed_h20, adaptive} × 3 seeds | 24 |
-| `ablation_metric` | Hopper × 3 uncertainty metrics × 3 seeds | 9 |
-| `ablation_ensemble` | Hopper × ensemble sizes {1,2,3} × 3 seeds | 12 |
-| `ablation_threshold` | Hopper × 4 threshold pairs × 3 seeds | 12 |
-
-### Running experiments
+### 1. Run baseline experiments (8 GPUs)
 
 ```bash
-# 1. Preview commands without running (dry run)
+# Dry-run first — prints all commands without executing
 python scripts/run_experiments.py --group main --dry_run
 
-# 2. List all experiments in a group
-python scripts/run_experiments.py --group main --list
+# Run main comparison: Hopper + Walker2d × {fixed_h5, fixed_h15, fixed_h20, adaptive} × 3 seeds
+# 24 experiments total; 8 GPUs, 8 parallel jobs
+python scripts/run_experiments.py --group main --parallel 8 --gpus 8
 
-# 3. Run sequentially (single GPU)
-python scripts/run_experiments.py --group main
+# Resume after a crash (skips already-done runs)
+python scripts/run_experiments.py --group main --parallel 8 --gpus 8 --skip_done
 
-# 4. Run in parallel — 3 jobs at once, cycling across 2 GPUs
-python scripts/run_experiments.py --group main --parallel 3 --gpus 2
-
-# 5. Run in parallel on a single GPU (2 jobs share the GPU)
-python scripts/run_experiments.py --group main --parallel 2 --gpus 1
-
-# 6. Resume: skip already-completed experiments
-python scripts/run_experiments.py --group main --parallel 6 --gpus 3 --skip_done
-
-# 7. Run all groups back-to-back
-python scripts/run_experiments.py --group all --parallel 6 --gpus 3 --skip_done
-
-# 8. Re-run a group from scratch (e.g. after deleting run directories)
-#    --reset marks all experiments in the group back to 'pending' before running.
-#    Other groups in the manifest are NOT affected.
-python scripts/run_experiments.py --group main --parallel 6 --gpus 3 --reset
+# Reset and re-run from scratch (wipes manifest status, keeps run dirs)
+python scripts/run_experiments.py --group main --parallel 8 --gpus 8 --reset
 ```
 
-> **Tip — GPU memory:** each job uses ~2–4 GB VRAM (ensemble_size=2, rollout_batch=512).
-> On a 24 GB card you can safely run `--parallel 4 --gpus 1`.
-> With 2 GPUs of 12 GB each, use `--parallel 4 --gpus 2`.
+> **GPU memory**: each job uses ~2–4 GB VRAM (ensemble=2, rollout_batch=512, hidden=256).
+> 8 jobs across 8 GPUs = 1 job per GPU, safe on any 10+ GB card.
 
-> **Tip — FPS and `num_envs`:** adding more parallel environments does **not** improve FPS if
-> `updates_per_step` is scaled proportionally. With N envs and `collect_per_step=4`, each outer
-> loop collects `4×N` transitions and fires `updates_per_step` GPU gradient updates.
-> FPS ∝ `(4×N) / (updates_per_step × T_gpu)`.
-> To actually gain speed from more envs, keep `updates_per_step` fixed (e.g. 4) regardless of N.
-> With `num_envs=8` and `updates_per_step=4` you get ~2× the FPS vs `num_envs=4` at a slightly
-> lower update intensity (1 update per 8 transitions instead of 1 per 4).
-
-### Collecting results and plotting
+### 2. Monitor live
 
 ```bash
-python scripts/collect_results.py
-```
+# Compact per-run status table (run this repeatedly while training)
+python scripts/scan_logs.py
 
-Reads `experiments/manifest.csv`, aggregates TensorBoard logs, and writes summary CSVs + plots to `experiments/results/`.
-
-### Full workflow
-
-```bash
-# Step 1 — main comparison (fixed horizons vs. adaptive)
-python scripts/run_experiments.py --group main --parallel 3 --gpus 2
-
-# Step 2 — ablations (can run while main is still going with --skip_done)
-python scripts/run_experiments.py --group ablation_metric --parallel 3 --gpus 2
-python scripts/run_experiments.py --group ablation_ensemble --parallel 3 --gpus 2
-python scripts/run_experiments.py --group ablation_threshold --parallel 3 --gpus 2
-
-# Step 3 — collect and plot
-python scripts/collect_results.py
-
-# Step 4 — monitor training live
+# TensorBoard
 tensorboard --logdir runs --port 8032
-
-# Step 5 — fill in thesis
-# open thesis/thesis_skeleton.tex and replace \RESULT{} markers
 ```
 
-### Checkpoint policy
+### 3. Run diagnostics on a checkpoint
 
-By default only two checkpoints are kept per run to save disk space:
-- `best.pt` — saved whenever a new best evaluation return is achieved
-- `latest.pt` — saved at the end of each training chunk (used for resuming)
-
-To re-enable periodic step snapshots (e.g. every 10k steps), set:
 ```bash
-python train.py ... training.save_periodic_checkpoints=true
+# Full health report: WM forward pass, AC stats, gradient norms, verdict
+python scripts/diagnose.py --run_dir runs/<exp_name>
+
+# Specific checkpoint (default: latest.pt)
+python scripts/diagnose.py --run_dir runs/<exp_name> --checkpoint best.pt
+```
+
+### 4. Watch learning curves
+
+```bash
+# PNG plots grouped by method, saved to plots/
+python scripts/visualize_runs.py --runs_dir runs/ --out plots/
+
+# Heavier smoothing for noisy curves
+python scripts/visualize_runs.py --runs_dir runs/ --smooth 0.8
+
+# Different metric (e.g. training return)
+python scripts/visualize_runs.py --runs_dir runs/ --metric train/return_mean_20
+```
+
+### 5. Generate agent videos
+
+```bash
+# All runs (picks best.pt automatically)
+python scripts/eval_videos.py --runs_dir runs/ --episodes 3
+
+# Single run
+python scripts/eval_videos.py --run_dir runs/<exp_name> --episodes 5
+
+# Specify device (cpu is fine for video generation)
+python scripts/eval_videos.py --run_dir runs/<exp_name> --device cpu
+```
+
+---
+
+## Diagnosing a bad run
+
+### Step 1 — scan_logs
+
+```bash
+python scripts/scan_logs.py
+```
+
+Look for flags in the output:
+
+| Flag | Meaning | Fix |
+|------|---------|-----|
+| `CONT_LOW` | `cont_prob_mean < 0.35` — WM thinks episodes always end | Check `cont_disc_floor=0.9` is set; check `cont_loss_weight=0.5` |
+| `VALUE_DIVERGE` | `return_scale > 50` — critic bootstrap exploded | Check `symlog_critic=true`, `symlog_clamp=9.0` in config |
+| `STD_HIGH` | `actor_std > 0.9` — policy not specialising | Normal early in training; bad if it persists past 50k steps |
+| `ACTOR_GRAD_TINY` | `actor_grad_norm < 0.001` | Check `entropy_coef=1e-2`, `pretanh_reg_coef=1e-3` are set |
+| `NAN` | Any NaN in losses | Immediate stop; check `symlog_clamp` and `ValueNet` zero-init |
+
+### Step 2 — diagnose
+
+```bash
+python scripts/diagnose.py --run_dir runs/<exp_name>
+```
+
+The script prints a **VERDICT** section at the end with `OK` / `PROBLEM` for each
+health check. Key things to read:
+
+- **KL encoding active** — should be `OK` (>30% of timesteps have KL > free_nats).
+  If `PROBLEM`, the posterior is collapsed: z carries no information.
+- **Gaussian entropy > 1 nat** — measures exploration. If `PROBLEM`, std has
+  collapsed and the policy is deterministic too early.
+- **Saturated actions < 10%** — if `PROBLEM`, the actor is stuck at ±1 and
+  `pretanh_reg_coef` may need to be raised.
+- **Reward RMSE < 1.0** — if `PROBLEM`, the world model hasn't learned reward
+  dynamics yet (may just be early training).
+
+### Step 3 — TensorBoard deep-dive
+
+Open TensorBoard and check:
+
+```
+value/bootstrap_mean     ← should be in [-500, 500], not ±1e6
+value/return_scale       ← should be in [1, 50]
+imagine/cont_prob_mean   ← should be in [0.7, 0.99]
+policy/std_mean          ← should start ~0.7, settle ~0.5
+loss/world_model         ← should decrease and flatten
+loss/actor               ← should decrease from ~1.0, never NaN
+```
+
+---
+
+## Ablations (run after baseline is confirmed)
+
+```bash
+# Uncertainty metric ablation (latent_mean_l2 vs next_obs_mean_l2 vs gaussian_kl)
+python scripts/run_experiments.py --group ablation_metric --parallel 8 --gpus 8
+
+# Ensemble size ablation (N=1,2,3)
+python scripts/run_experiments.py --group ablation_ensemble --parallel 8 --gpus 8
+
+# Threshold sensitivity (τ_high, τ_mid pairs)
+python scripts/run_experiments.py --group ablation_threshold --parallel 8 --gpus 8
+
+# Collect all results into CSVs + thesis figures
+python scripts/collect_results.py
+```
+
+---
+
+## Code structure
+
+```
+train.py                          entry point
+configs/
+  config.yaml                     base config (all defaults)
+  hopper_baseline.yaml            Hopper fixed_h15 reference
+  hopper_adaptive.yaml            Hopper adaptive
+  walker2d_baseline.yaml
+  walker2d_adaptive.yaml
+  quickstart.yaml                 InvertedPendulum smoke test
+
+thesiswm/
+  models/
+    rssm.py                       RSSM + EnsembleWorldModel
+    networks.py                   MLP, DiagGaussian
+  agents/
+    actor_critic.py               TanhGaussianPolicy + ValueNet
+  training/
+    trainer.py                    orchestrator: collection loop, eval, checkpointing
+    world_model_updater.py        update_world_model() — WM loss + optimizer step
+    actor_critic_updater.py       update_actor_critic() — imagination + AC loss
+    imagination.py                lambda_returns(), decide_horizon()
+  data/
+    replay_buffer.py              sequence replay buffer
+  utils/
+    symlog.py                     symlog/symexp (DreamerV3 §A.2)
+    checkpoint.py                 save/load with rollback support
+    sigreg.py                     SIGReg regulariser
+    seed.py / rng.py              seeding + RNG state capture
+    video.py                      MP4 writer (imageio-ffmpeg)
+    logger.py                     TBLogger wrapper
+
+scripts/
+  run_experiments.py              launch experiment groups (parallel, multi-GPU)
+  scan_logs.py                    live run health monitor
+  diagnose.py                     checkpoint health report (WM + AC stats + verdict)
+  visualize_runs.py               learning curve plots from TensorBoard
+  eval_videos.py                  batch video generation from checkpoints
+  collect_results.py              full thesis results: CSVs + publication figures
+  smoke_test.py                   fast sanity check (~2 min, no GPU needed)
+  check_mujoco_render.py          verify headless MuJoCo rendering works
+  test_symlog_critic.py           unit tests for symlog critic
+
+thesis/
+  thesis_skeleton.tex             LaTeX skeleton with \RESULT{} markers
+  plain_language_guide.md         plain-language notes on the method
+```
+
+---
+
+## Key design decisions (thesis contribution)
+
+| Component | Choice | Why |
+|-----------|--------|-----|
+| Adaptive horizon | Ensemble disagreement → H ∈ {5, 10, 20} | Core contribution: uncertainty-aware planning depth |
+| Uncertainty metric | `latent_mean_l2` (pairwise between ensemble members) | Operates in z-space (≈N(0,I)); scale matches thresholds |
+| Critic | Symlog space + EMA target (decay=0.98) | Prevents bootstrap divergence (DreamerV3 §A.2) |
+| Actor | TanhGaussian, Gaussian entropy, pretanh_reg | Prevents saturation, keeps gradients alive |
+| WM regulariser | SIGReg (weight=0.01) | Pushes posterior z toward N(0,I), aids KL |
+| Cont head | Positive bias init (+3.0), floor=0.9 | Prevents early cont collapse killing horizon |
+
+---
+
+## Install
+
+```bash
+pip install torch gymnasium[mujoco] hydra-core omegaconf tensorboard imageio[ffmpeg] tqdm
+```
+
+Set `MUJOCO_GL=egl` for headless rendering on a server (required for videos):
+```bash
+export MUJOCO_GL=egl
 ```

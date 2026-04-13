@@ -1,0 +1,26 @@
+# ── PyTorch (CUDA 12.4 wheel; forward-compatible with CUDA 12.8 runtime) ───────
+# Tesla V100S is Compute Capability 7.0 (sm_70 / Volta).
+# CUDA 12.8 driver is forward-compatible with wheels built for CUDA 12.4.
+# Install PyTorch before the rest:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.5.1
+
+# ── Core scientific stack ───────────────────────────────────────────────────────
+numpy>=1.24
+
+# ── RL environment ──────────────────────────────────────────────────────────────
+# MuJoCo physics (Hopper-v4, Walker2d-v4, InvertedPendulum-v5)
+gymnasium[mujoco]>=0.29
+mujoco>=3.0
+
+# ── Config management ───────────────────────────────────────────────────────────
+hydra-core>=1.3
+omegaconf>=2.3
+
+# ── Logging & monitoring ────────────────────────────────────────────────────────
+tensorboard>=2.14
+tqdm>=4.65
+
+# ── Video export ────────────────────────────────────────────────────────────────
+imageio>=2.31
+imageio-ffmpeg>=0.4

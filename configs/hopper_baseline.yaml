@@ -21,3 +21,12 @@ method:
 
 imagination:
   horizon_fixed: 15
+
+agent:
+  # entropy_coef=1e-2: now effective after no_grad caching bug was fixed in trainer.py.
+  # log_std ceiling is +0.5 (std≤1.65) in actor_critic.py, so this won't cause entropic explosion.
+  entropy_coef: 1e-2
+
+  # Penalises atanh(mean)² (raw pre-tanh MLP output); fixed from mean² which had near-zero
+  # gradient at tanh saturation (Jacobian ≈ 0.009 at mean=0.99).
+  pretanh_reg_coef: 1e-3

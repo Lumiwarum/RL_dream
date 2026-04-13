@@ -145,7 +145,10 @@ class WorldModel(nn.Module):
         self.obs_head = MLP(feat_dim, obs_dim, hidden_dim=hidden_dim, num_layers=2)
         self.rew_head = MLP(feat_dim, 1, hidden_dim=hidden_dim, num_layers=2)
         self.cont_head = MLP(feat_dim, 1, hidden_dim=hidden_dim, num_layers=2)
-
+        # Prior: episodes usually continue. sigmoid(+3) ≈ 0.95 — without this bias the default
+        # sigmoid(0)=0.5 means the WM immediately learns low cont_prob from early falling-robot
+        # data, collapsing imagination discounts and preventing the actor from seeing long-horizon reward.
+        nn.init.constant_(self.cont_head.net[-1].bias, 3.0)
 
         # Predict next_obs given current latent feature; in this simple setup we predict obs_t directly.
         # For stability on MuJoCo state vectors, predicting obs_t works fine with proper sequence setup.
@@ -218,19 +221,22 @@ class EnsembleWorldModel(nn.Module):
             next_obs_means.append(wm.predict_obs(feat1))
 
         if metric == "latent_mean_l2":
-            # pairwise average distance to first member (simple, ensemble small)
-            base = next_z_means[0]
-            d = 0.0
-            for k in range(1, self.n):
-                d = d + torch.norm(next_z_means[k] - base, dim=-1)
-            return d / float(self.n - 1)
+            # True pairwise average: all (i,j) pairs, each member weighted equally.
+            # Comparing only vs member-0 gives member-0 double weight for N≥3.
+            d, count = 0.0, 0
+            for i in range(self.n):
+                for j in range(i + 1, self.n):
+                    d = d + torch.norm(next_z_means[i] - next_z_means[j], dim=-1)
+                    count += 1
+            return d / float(count)
 
         if metric == "next_obs_mean_l2":
-            base = next_obs_means[0]
-            d = 0.0
-            for k in range(1, self.n):
-                d = d + torch.norm(next_obs_means[k] - base, dim=-1)
-            return d / float(self.n - 1)
+            d, count = 0.0, 0
+            for i in range(self.n):
+                for j in range(i + 1, self.n):
+                    d = d + torch.norm(next_obs_means[i] - next_obs_means[j], dim=-1)
+                    count += 1
+            return d / float(count)
 
         if metric == "gaussian_kl":
             if self.n == 2:

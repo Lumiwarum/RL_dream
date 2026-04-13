@@ -9,6 +9,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from thesiswm.envs.make_env import make_env
+from thesiswm.models.rssm import RSSMState
 from thesiswm.training.trainer import load_checkpoint_into_trainer_state
 from thesiswm.utils.seed import set_global_seeds
 from thesiswm.utils.video import write_mp4
@@ -103,6 +104,7 @@ def _hydra_entrypoint(config_name: str):
 
         os.makedirs(str(cfg.eval.video_dir), exist_ok=True)
 
+        wm0 = trainer.world_model_ensemble.models[0]
         for ep in range(int(cfg.eval.episodes)):
             obs, _ = env.reset(seed=int(cfg.seed) + 10_000 + ep)
             done = False
@@ -110,12 +112,17 @@ def _hydra_entrypoint(config_name: str):
             ret = 0.0
             length = 0
             frames = []
+            rssm_state = wm0.rssm.init_state(1, device)
+            prev_action = torch.zeros(1, wm0.rssm.act_dim, device=device)
 
             while not (done or trunc):
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 with torch.no_grad():
-                    # deterministic action for evaluation
-                    action = trainer.agent.act_deterministic_from_obs(obs_t, trainer.world_model_ensemble, device=device)
+                    h = wm0.rssm.deter_step(rssm_state.h, rssm_state.z, prev_action)
+                    z = wm0.rssm.posterior(h, obs_t).mean
+                    action = trainer.agent.actor.mean_action(torch.cat([h, z], dim=-1))
+                rssm_state = RSSMState(h=h, z=z)
+                prev_action = action.detach()
                 action_np = action.squeeze(0).cpu().numpy().astype(np.float32)
 
                 if cfg.eval.record_video:
