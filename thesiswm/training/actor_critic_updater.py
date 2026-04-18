@@ -31,18 +31,40 @@ def choose_horizon(
     obs0: torch.Tensor,
     act0: torch.Tensor,
     device: torch.device,
+    ema_obs_loss: float = 1.0,
 ) -> Tuple[int, float]:
     """
     Select imagination horizon based on method config.
 
-    Fixed baselines use a single pre-set H; adaptive methods query the
-    ensemble disagreement to pick from [H_low, H_mid, H_high].
+    Fixed baselines use a single pre-set H.
+
+    Adaptive methods have two uncertainty signals:
+      use_obs_loss_unc=false (default): ensemble latent disagreement — stable per-seed,
+        selects a horizon once and keeps it for the whole run.
+      use_obs_loss_unc=true: EMA WM obs_loss — varies throughout training (high early,
+        low late), giving genuine within-run horizon switching as the WM converges.
     """
     name = str(cfg.method.name)
     if name.startswith("fixed_h"):
         h_map = {"fixed_h5": 5, "fixed_h15": 15, "fixed_h20": 20}
         return h_map.get(name, int(cfg.imagination.horizon_fixed)), 0.0
 
+    horizons = tuple(int(x) for x in cfg.imagination.horizons)
+
+    if bool(getattr(cfg.method, "use_obs_loss_unc", False)):
+        # Dynamic signal: EMA of WM obs reconstruction loss.
+        # High obs_loss → WM still learning → short horizon (less error amplification).
+        # Low obs_loss → WM converged → long horizon (better credit assignment).
+        h_low, h_mid, h_high = horizons
+        thresh_h = float(getattr(cfg.method, "obs_loss_thresh_high", 0.30))
+        thresh_m = float(getattr(cfg.method, "obs_loss_thresh_mid",  0.18))
+        if ema_obs_loss > thresh_h:
+            return h_low,  float(ema_obs_loss)
+        if ema_obs_loss > thresh_m:
+            return h_mid,  float(ema_obs_loss)
+        return h_high, float(ema_obs_loss)
+
+    # Default: ensemble disagreement (original signal)
     H, u = decide_horizon(
         ensemble=ensemble,
         obs=obs0,
@@ -50,7 +72,7 @@ def choose_horizon(
         metric=str(cfg.method.uncertainty_metric),
         thresh_high=float(cfg.method.thresh_high),
         thresh_mid=float(cfg.method.thresh_mid),
-        horizons=tuple(int(x) for x in cfg.imagination.horizons),
+        horizons=horizons,
         device=device,
     )
     return int(H), float(u.mean().item())
@@ -70,6 +92,7 @@ def update_actor_critic(
     tb_fn,          # callable(tag, value, step) — TBLogger.scalar
     step: int,
     critic_ema: float = 0.98,
+    ema_obs_loss: float = 1.0,
 ) -> Tuple[float, float, int, float, float]:
     """
     One imagination-based actor-critic update.
@@ -85,7 +108,7 @@ def update_actor_critic(
 
     obs0 = obs_seq[:, -1]
     act0 = act_seq[:, -1]
-    H, unc_mean = choose_horizon(ensemble, cfg, obs0, act0, device)
+    H, unc_mean = choose_horizon(ensemble, cfg, obs0, act0, device, ema_obs_loss=ema_obs_loss)
 
     # Pick one ensemble member at random for imagination rollouts.
     # WM is frozen during actor-critic updates; actor gradients flow through
@@ -281,6 +304,7 @@ def warmup_critic(
     tb_fn,
     step: int,
     critic_ema: float = 0.98,
+    ema_obs_loss: float = 1.0,
 ) -> float:
     """
     Critic-only update — used during the WM warmup window (start_learning → actor_start_step).
@@ -299,10 +323,16 @@ def warmup_critic(
     obs_seq = torch.as_tensor(seq["obs"],     dtype=torch.float32, device=device)
     act_seq = torch.as_tensor(seq["actions"], dtype=torch.float32, device=device)
 
-    # Use the fixed horizon for critic warmup (adaptive not needed here)
-    H_map = {"fixed_h5": 5, "fixed_h15": 15, "fixed_h20": 20}
-    name  = str(cfg.method.name)
-    H     = H_map.get(name, int(cfg.imagination.horizon_fixed))
+    # Use the same horizon-selection logic as the full actor-critic update so that
+    # the critic is calibrated for the horizon length it will see during actor training.
+    name = str(cfg.method.name)
+    if name.startswith("fixed_h"):
+        H_map = {"fixed_h5": 5, "fixed_h15": 15, "fixed_h20": 20}
+        H     = H_map.get(name, int(cfg.imagination.horizon_fixed))
+    else:
+        obs0 = obs_seq[:, -1]
+        act0 = act_seq[:, -1]
+        H, _ = choose_horizon(ensemble, cfg, obs0, act0, device, ema_obs_loss=ema_obs_loss)
 
     wm_id = np.random.randint(0, len(ensemble.models))
     wm    = ensemble.models[wm_id]

@@ -44,9 +44,9 @@ def decide_horizon(
     """
     Choose a single horizon for the batch based on mean disagreement.
 
-    If mean_uncertainty > high -> H=5
-    elif > mid -> H=10
-    else -> H=20
+    If mean_uncertainty > high -> H=horizons[0] (e.g. H=10)
+    elif > mid              -> H=horizons[1] (e.g. H=15)
+    else                    -> H=horizons[2] (e.g. H=20)
     """
     u = ensemble.disagreement(obs=obs, action=action, metric=metric, device=device)  # [B]
     m = u.mean()

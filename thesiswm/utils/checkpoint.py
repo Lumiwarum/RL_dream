@@ -42,6 +42,7 @@ class Checkpointer:
             "metrics": {
                 "best_eval_return":  float(getattr(trainer, "best_eval_return",  -1e9)),
                 "best_train_return": float(getattr(trainer, "best_train_return", -1e9)),
+                "return_scale":      float(getattr(trainer, "_return_scale",     1.0)),
             }
         }
         return ckpt
@@ -60,6 +61,7 @@ class Checkpointer:
             "metrics": {
                 "best_eval_return":  float(getattr(trainer, "best_eval_return",  -1e9)),
                 "best_train_return": float(getattr(trainer, "best_train_return", -1e9)),
+                "return_scale":      float(getattr(trainer, "_return_scale",     1.0)),
             }
         }
 
@@ -119,6 +121,8 @@ class Checkpointer:
 
         trainer.best_eval_return  = float(ckpt["metrics"]["best_eval_return"])
         trainer.best_train_return = float(ckpt["metrics"]["best_train_return"])
+        if "return_scale" in ckpt.get("metrics", {}):
+            trainer._return_scale = float(ckpt["metrics"]["return_scale"])
 
         if restore_step:  # Only restore RNG on full restore (not rollback)
             restore_rng_state(ckpt["rng"])

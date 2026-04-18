@@ -26,7 +26,7 @@ Experiment Groups
 -----------------
   main              -- Hopper + Walker2d × {fixed_h5, fixed_h15, fixed_h20, adaptive} × 3 seeds
   ablation_metric   -- Hopper × 3 uncertainty metrics (adaptive only) × 3 seeds
-  ablation_ensemble -- Hopper × ensemble size {1→fixed, 2→adaptive, 3→adaptive} × 3 seeds
+  ablation_ensemble -- Hopper × ensemble size {N=1 fixed_h20, N=2 fixed_h20, N=2 adaptive} × 3 seeds
   ablation_threshold-- Hopper × 4 threshold pairs (adaptive) × 3 seeds
 
 Each completed run is recorded in experiments/manifest.csv so that
@@ -58,7 +58,7 @@ MANIFEST_PATH = ROOT / "experiments" / "manifest.csv"
 class Experiment:
     group: str            # which ablation group this belongs to
     env_id: str
-    method: str           # fixed_h5 | fixed_h15 | fixed_h20 | adaptive_5_10_20
+    method: str           # fixed_h5 | fixed_h15 | fixed_h20 | adaptive_10_15_20
     seed: int
     extra_overrides: List[str]  # additional Hydra overrides
     base_config: str = "config"
@@ -106,55 +106,73 @@ FIXED_VARIANTS = {
 }
 
 ADAPTIVE_OVERRIDES_PER_ENV = {
-    # Use latent_mean_l2 (not next_obs_mean_l2): next_obs_mean_l2 operates in raw
-    # observation space where Hopper L2 distances are O(4-5), making thresholds like
-    # 0.30 impossibly tight → adaptive always selects H_min.
-    # latent_mean_l2 operates in z-space (64-dim, z≈N(0,I)), where disagreement is
-    # O(0.5-3.0) between ensemble members, matching these thresholds.
-    # Empirical calibration from first pilot (300k steps, trained ensemble):
-    # latent_mean_l2 for trained models = 0.33-0.78 (much less than random-init ≈11.3
-    # because both ensemble members converge to similar representations).
-    # Observed range from pilot report (report_20260412):
-    #   Hopper:   med=0.37–0.72,  p95=0.42–0.78
-    #   Walker2d: med=0.62–1.79,  p95=0.66–1.85  ← much wider than Hopper
-    # Hopper: thresholds at ~p75 and ~p50 of [0.44, 0.75]
-    #   uncertainty > 0.70 → H=5   (high disagreement → short, safe horizon)
-    #   uncertainty > 0.55 → H=10  (medium disagreement)
-    #   else               → H=20  (low disagreement → long horizon)
-    # Walker2d: thresholds recalibrated for wider uncertainty range [0.62, 1.79]
-    # at ~p75 and ~p40 so all three horizons get used:
-    #   uncertainty > 1.50 → H=5
-    #   uncertainty > 0.80 → H=10
-    #   else               → H=20
-    "Hopper-v4":   ["method.uncertainty_metric=latent_mean_l2",
-                    "method.thresh_high=0.70", "method.thresh_mid=0.55",
-                    "imagination.horizons=[5,10,20]"],
-    "Walker2d-v4": ["method.uncertainty_metric=latent_mean_l2",
-                    "method.thresh_high=1.50", "method.thresh_mid=0.80",
-                    "imagination.horizons=[5,10,20]"],
+    # ── Uncertainty signal: EMA WM obs_loss (use_obs_loss_unc=true) ─────────────
+    # The original latent_mean_l2 ensemble-disagreement signal settles to a STABLE
+    # per-seed value within ~500 WM updates (before actor_start_step) → each seed
+    # locks to exactly one horizon for the whole run. No within-run switching.
+    #
+    # EMA obs_loss (wm/ema_obs_loss in TB) varies throughout training:
+    #   High early (WM still learning) → gradually falls as WM converges
+    #   → gives genuine within-run switching as WM quality improves.
+    #   Initialised at 2.0 so the first horizon is always H=10 (cautious start).
+    #
+    # ── Hopper thresholds (obs_loss range: early≈0.20–0.28, late≈0.15–0.20) ────
+    #   obs_loss > 0.28 → H=10  (WM struggling / policy exploring new states)
+    #   obs_loss > 0.17 → H=15  (WM mostly converged, ~steps 50k–400k)
+    #   obs_loss < 0.17 → H=20  (WM converged, ~steps 400k+)
+    #   WHY 0.28 not 0.22: true Hopper obs_loss is 0.19–0.25. With thresh=0.22,
+    #   the EMA (initialized to 2.0) converges below the threshold within ~215 WM
+    #   updates (well before actor_start=8k), giving essentially NO H=10 phase
+    #   during actual actor training. thresh=0.28 ensures H=10 is selected whenever
+    #   the policy is actively exploring (obs_loss bumps to 0.22–0.26), giving a
+    #   genuine 3-phase H=10→H=15→H=20 schedule across a 500k run.
+    #
+    # ── Walker2d thresholds (obs_loss range: early≈2.0–2.5, late≈1.1–1.7) ──────
+    #   obs_loss > 1.50 → H=10  (WM inaccurate, ~steps 8k–50k with actor_start=8k)
+    #   obs_loss > 1.00 → H=15  (WM improving, ~steps 50k–500k)
+    #   obs_loss < 1.00 → H=20  (rarely reached at 500k; Walker2d WM still converging)
+    "Hopper-v4": [
+        "method.uncertainty_metric=latent_mean_l2",  # kept for fallback/logging
+        "method.thresh_high=0.90", "method.thresh_mid=0.55",
+        "imagination.horizons=[10,15,20]",
+        "method.use_obs_loss_unc=true",
+        "method.obs_loss_thresh_high=0.28",
+        "method.obs_loss_thresh_mid=0.17",
+    ],
+    "Walker2d-v4": [
+        "method.uncertainty_metric=latent_mean_l2",
+        "method.thresh_high=1.50", "method.thresh_mid=0.80",
+        "imagination.horizons=[10,15,20]",
+        "method.use_obs_loss_unc=true",
+        "method.obs_loss_thresh_high=1.50",
+        "method.obs_loss_thresh_mid=1.00",
+    ],
 }
 
 SHARED_TRAINING_OVERRIDES = [
     # ── Steps ───────────────────────────────────────────────────────────────────
-    # 300k pilot: verify learning curves before committing to longer runs.
-    # Hopper converges by ~250k; Walker2d shows a clear trend by 300k.
-    # Bump to 500k / 1M after reviewing pilot results.
-    "training.total_steps=300000",
-    "training.steps_per_chunk=300000",  # must match total_steps (single-subprocess design)
+    # 500k: extended from 300k after pilot. At 300k: adaptive > all fixed on both envs.
+    # Hopper adaptive s0/s1 still trending up at 300k; Walker2d WM still converging.
+    # Existing runs at 300k will continue for another 200k when relaunched.
+    "training.total_steps=500000",
+    "training.steps_per_chunk=500000",  # must match total_steps (single-subprocess design)
 
     # ── Env collection ──────────────────────────────────────────────────────────
     "env.num_envs=8",
 
     # ── Learning schedule ───────────────────────────────────────────────────────
     "training.start_learning=5000",
-    # actor_start_step > start_learning: let the world model train for 15k steps
-    # before the actor/critic touch it. At 5k steps the replay is full of random-
-    # policy data where Hopper falls in <50 steps → cont_prob≈0.6, reward predictions
-    # noisy. Starting AC at 20k gives the WM 15k gradient steps to learn episode
-    # structure (cont, reward) before bootstrap values enter lambda-return targets.
-    # Without this, the critic receives targets dominated by a bad bootstrap and can
-    # spiral: over-estimated V → large advantage std → rscale grows → actor stops.
-    "training.actor_start_step=20000",
+    # actor_start_step: start actor early so it trains while WM uncertainty is still
+    # declining (critical window for testing the adaptive hypothesis).
+    # WM uncertainty starts ~11 (random init) and drops to steady-state 0.5-1.8
+    # over the first 10-15k steps. With actor_start=5k, the actor sees high-unc
+    # early training where H=5 should be selected, then progressively transitions
+    # to H=10/H=20 as WM improves — this IS the thesis hypothesis.
+    # At step 5k the WM has had 0 gradient steps (start_learning=5k too), so we
+    # use critic warmup (steps 5k→8k) to stabilise before actor begins.
+    # Note: entropy_coef=3e-4 prevents the early instability that previously
+    # required delaying the actor to step 20k.
+    "training.actor_start_step=8000",
     "training.checkpoint_every_steps=10000",
     "training.log_every_steps=2000",
 
@@ -188,56 +206,141 @@ SHARED_TRAINING_OVERRIDES = [
     "world_model.sigreg_weight=0.01",
 
     # ── Actor-critic ─────────────────────────────────────────────────────────────
-    # actor_lr=1e-4: raised from 3e-5 — with entropy+pretanh_reg preventing saturation,
-    #   the conservative 3e-5 was leaving actor_grad_norm at ~0.02 (barely learning).
-    #   Matching critic_lr=1e-4 gives better actor-critic balance.
-    # entropy_coef=1e-2: Gaussian (pre-tanh) entropy — always positive, correct gradient direction.
-    #   The log_prob-based entropy goes negative when |tanh(mean)|→1, causing entropy term to
-    #   PENALISE instead of rewarding diversity. Gaussian entropy never has this problem.
-    #   Previously broken (no_grad caching bug gave zero gradient); now works correctly.
-    #   log_std ceiling at +0.5 (actor_critic.py) prevents entropic explosion if this is still
-    #   too strong; floor at -1.0 prevents collapse if this is too weak.
-    # pretanh_reg_coef=1e-3: L2 penalty on raw pre-tanh MLP output (recovered via atanh);
-    #   prevents the actor from drifting to the tanh saturation boundary.
-    "agent.actor_lr=1e-4",
-    "agent.critic_lr=1e-4",
-    "agent.entropy_coef=1e-2",
+    # actor_lr=3e-5, critic_lr=3e-5: DreamerV3 reference values.
+    #   Lower LR prevents rapid drift to tanh saturation boundary (actor) and
+    #   prevents fast critic divergence during warmup that drives SPIKE_THEN_DROP.
+    # entropy_coef=3e-4: DreamerV3 level (~1e-4 for their tasks).
+    #   Old value 1e-2 was 30x too high — entropy dominated actor loss early,
+    #   freezing policy_std≈1.0, then causing sudden collapse when return gradient
+    #   grew large enough to override entropy (SPIKE_THEN_DROP in 13/24 runs).
+    #   3e-4 uses analytic Gaussian entropy (always positive, never penalises exploration).
+    # pretanh_reg_coef=1e-3: L2 penalty on raw pre-tanh MLP output prevents actor
+    #   drifting to tanh saturation boundary.
+    "agent.actor_lr=3e-5",
+    "agent.critic_lr=3e-5",
+    "agent.entropy_coef=3e-4",
     "agent.pretanh_reg_coef=1e-3",
 
-    # ── Rollback — DISABLED ───────────────────────────────────────────────────────
-    # The rollback mechanism triggered an infinite loop on Hopper:
-    #   train_rollback_drop=20 ≈ natural episode-to-episode variance (sigma≈20 with random policy)
-    #   → bad_streak fires every 2-3 episodes → 528 rollbacks in 50k steps
-    #   → each rollback reloads cont predictor weights from an early checkpoint where p≈0.5
-    #   → cont predictor never converges → discounts stay ≈0.5 → actor can't learn
-    # Disabling until the agent reaches a regime where returns are high and stable enough
-    # for rollback thresholds to be meaningful (well above variance).
+    # ── Rollback ─────────────────────────────────────────────────────────────────
+    # train_rollback_check is DISABLED: episode-return variance (~20 sigma with early policy)
+    # triggers bad_streak every 2-3 episodes → hundreds of rollbacks in the first 50k steps
+    # → cont predictor never converges → discounts stay ≈0.5 → actor can't learn.
+    #
+    # Eval-based rollback IS enabled: eval fires every 10k steps (not noisy), rollback_drop=15
+    # requires a 15-point drop from best eval for rollback_patience=4 consecutive evals
+    # (= 40k steps of sustained degradation) before triggering. The rollback_cooldown_steps=40000
+    # guard in trainer.py prevents re-triggering within 40k steps, avoiding thrashing.
+    # This recovers SPIKE_THEN_DROP runs (e.g., Walker2d fixed_h20 peak=206→-1) where the
+    # best checkpoint is saved but the policy degrades as WM continues to update.
     "training.train_rollback_check=false",
-    "training.rollback_drop=0",          # 0 disables eval rollback (condition: rollback_drop > 0)
+    "training.rollback_drop=15",         # fire if eval drops 15 from best for 4 consecutive evals
+    "training.rollback_patience=4",
+    "training.rollback_cooldown_steps=40000",  # no re-rollback within 40k steps
     "training.save_best_train=false",    # no best_train.pt — nothing to roll back to
+    # WM freeze after rollback: after restoring best.pt, suppress WM gradient updates
+    # for 20k steps. Without this, the WM is immediately overwritten by current replay
+    # data (~1000 gradient updates) → the restored actor/critic become invalid again
+    # → rollback appears to do nothing. 20k steps ≈ 5 eval cycles; matches rollback_cooldown.
+    "training.wm_freeze_after_rollback=20000",
 ]
 
 
+# Walker2d has 17-dim obs and more complex dynamics than Hopper (11-dim).
+# WM obs_loss at the default actor_start_step=8k is still ~2.0 (random-init WM).
+# The actor finds a local gait in this inaccurate WM, peaks at eval=111-219, then
+# collapses as the WM improves and the learned gait stops working (SPIKE_THEN_DROP).
+#
+# Fixed methods (fixed_h20): must delay to 50k so the WM is partially trained before
+# the actor begins. Using H=20 on obs_loss≈2.0 is dangerous — long bootstrap chains
+# amplify WM errors → SPIKE_THEN_DROP.
+#
+# Adaptive method: actor_start=8k (same as Hopper). At step 8k the WM has had ~3k
+# gradient updates and obs_loss is still ~2.5 >> obs_loss_thresh_high=1.50 → H=10 is
+# selected. This tests the thesis hypothesis: "adaptive H=10 early (when WM is bad)
+# enables earlier, safer actor training than fixed H=20."
+# NOTE: actor_start=15k was tried but with ~40k WM gradient steps the obs_loss
+# already drops to ~1.4 < thresh_high=1.5 → H=15 immediately, no H=10 phase ever.
+# actor_start=8k keeps obs_loss above the threshold → genuine H=10→H=15→H=20 schedule.
+WALKER2D_FIXED_ACTOR_OVERRIDE    = ["training.actor_start_step=50000"]
+WALKER2D_ADAPTIVE_ACTOR_OVERRIDE = ["training.actor_start_step=8000"]
+
+
 def make_main_experiments() -> List[Experiment]:
+    # Interleave methods and seeds so that with --parallel N, the first N jobs
+    # include a mix of fixed AND adaptive runs (not all fixed first).
+    # Order: seed first, then method — so seed=0 of all methods starts together.
     exps = []
-    for env in ENVS_MAIN:
-        for method, method_overrides in FIXED_VARIANTS.items():
-            for seed in SEEDS:
+    all_variants = list(FIXED_VARIANTS.items()) + [
+        ("adaptive_10_15_20", None)  # overrides come from ADAPTIVE_OVERRIDES_PER_ENV
+    ]
+    for seed in SEEDS:
+        for env in ENVS_MAIN:
+            for method, method_overrides in all_variants:
+                # Walker2d: fixed methods wait 50k for WM to stabilise; adaptive can
+                # start at 15k because high uncertainty → H=10 (safe on bad WM).
+                if env == "Walker2d-v4":
+                    env_extra = (WALKER2D_ADAPTIVE_ACTOR_OVERRIDE
+                                 if method == "adaptive_10_15_20"
+                                 else WALKER2D_FIXED_ACTOR_OVERRIDE)
+                else:
+                    env_extra = []
+
+                if method == "adaptive_10_15_20":
+                    overrides = ADAPTIVE_OVERRIDES_PER_ENV[env] + SHARED_TRAINING_OVERRIDES + env_extra
+                else:
+                    overrides = method_overrides + SHARED_TRAINING_OVERRIDES + env_extra
                 exps.append(Experiment(
                     group="main",
                     env_id=env,
                     method=method,
                     seed=seed,
-                    extra_overrides=method_overrides + SHARED_TRAINING_OVERRIDES,
+                    extra_overrides=overrides,
                 ))
-        # Adaptive
-        for seed in SEEDS:
+    return exps
+
+
+# ── SMOKE TEST GROUP ───────────────────────────────────────────────────────────
+# Fast sanity check: Hopper × {fixed_h20, adaptive} × 2 seeds × 100k steps.
+# Use this BEFORE running the full main group to verify:
+#   1. WM loss (obs/rew/kl) is trending down (WM learning)
+#   2. policy_std decreases from 1.0 (entropy fix working, no SPIKE_THEN_DROP)
+#   3. adaptive shows horizon_trend ↑ early→late (H=10 early, H=20 late as WM converges)
+# 4 runs, ~30 min on a single GPU (Hopper is fast).
+
+SMOKE_OVERRIDES = [
+    o for o in SHARED_TRAINING_OVERRIDES
+    if not o.startswith("training.total_steps")
+    and not o.startswith("training.steps_per_chunk")
+    and not o.startswith("training.eval_every_steps")
+    and not o.startswith("training.log_every_steps")
+] + [
+    "training.total_steps=100000",
+    "training.steps_per_chunk=100000",
+    "training.eval_every_steps=2000",   # eval every 2k for tight feedback loop
+    "training.log_every_steps=500",     # log every 500 for dense diagnostics
+]
+
+
+def make_smoke_experiments() -> List[Experiment]:
+    """4 runs: Hopper × {fixed_h20, adaptive} × seeds {0, 1}."""
+    exps = []
+    smoke_seeds = [0, 1]
+    smoke_methods = [
+        ("fixed_h20",      ["imagination.horizon_fixed=20"]),
+        ("adaptive_10_15_20", None),
+    ]
+    for seed in smoke_seeds:
+        for method, method_overrides in smoke_methods:
+            if method == "adaptive_10_15_20":
+                overrides = ADAPTIVE_OVERRIDES_PER_ENV["Hopper-v4"] + SMOKE_OVERRIDES
+            else:
+                overrides = method_overrides + SMOKE_OVERRIDES
             exps.append(Experiment(
-                group="main",
-                env_id=env,
-                method="adaptive_5_10_20",
+                group="smoke",
+                env_id="Hopper-v4",
+                method=method,
                 seed=seed,
-                extra_overrides=ADAPTIVE_OVERRIDES_PER_ENV[env] + SHARED_TRAINING_OVERRIDES,
+                extra_overrides=overrides,
             ))
     return exps
 
@@ -266,35 +369,45 @@ def make_ablation_metric_experiments() -> List[Experiment]:
             exps.append(Experiment(
                 group="ablation_metric",
                 env_id="Hopper-v4",
-                method="adaptive_5_10_20",
+                method="adaptive_10_15_20",
                 seed=seed,
                 extra_overrides=[
                     f"method.uncertainty_metric={metric}",
                     f"method.thresh_high={th_high}",
                     f"method.thresh_mid={th_mid}",
-                    "imagination.horizons=[5,10,20]",
+                    "imagination.horizons=[10,15,20]",
                 ] + SHARED_TRAINING_OVERRIDES,
             ))
     return exps
 
 
 # ── ABLATION: ENSEMBLE SIZE ────────────────────────────────────────────────────
-# N=1 with adaptive is impossible (no disagreement), so we test:
-#   - N=1, Fixed-H15  (no ensemble benefit)
-#   - N=2, Fixed-H15  (ensemble WM but fixed horizon)
-#   - N=2, Adaptive   (our method)
-#   - N=3, Adaptive   (larger ensemble)
+# Tests whether the ensemble WM (N=2) improves over a single WM (N=1).
+# N=1 with adaptive is meaningless (no disagreement signal, and obs_loss signal
+# works the same regardless), so we use fixed horizons for the N comparison:
+#   - N=1, Fixed-H20  (single WM; same horizon as our best fixed baseline)
+#   - N=2, Fixed-H20  (ensemble WM; same horizon — isolates the ensemble effect)
+#   - N=2, Adaptive   (our full method: ensemble + obs_loss adaptive horizon)
+# This gives the thesis two clean claims:
+#   (1) N=2 Fixed vs N=1 Fixed → does the ensemble WM alone improve stability/performance?
+#   (2) N=2 Adaptive vs N=2 Fixed → does the adaptive horizon add on top of the ensemble?
+# Uses Hopper-v4 (fast, 3 seeds, 500k steps) matching the main group setup.
 
 def make_ablation_ensemble_experiments() -> List[Experiment]:
+    # Adaptive overrides use the same obs_loss signal as the main group (Hopper thresholds)
+    _adaptive_ov = [
+        "method.uncertainty_metric=latent_mean_l2",
+        "method.thresh_high=0.90", "method.thresh_mid=0.55",
+        "imagination.horizons=[10,15,20]",
+        "method.use_obs_loss_unc=true",
+        "method.obs_loss_thresh_high=0.28",
+        "method.obs_loss_thresh_mid=0.17",
+        "world_model.ensemble_size=2",
+    ]
     configs = [
-        (1, "fixed_h15",      ["imagination.horizon_fixed=15", "world_model.ensemble_size=1"]),
-        (2, "fixed_h15",      ["imagination.horizon_fixed=15", "world_model.ensemble_size=2"]),
-        (2, "adaptive_5_10_20", ["method.uncertainty_metric=latent_mean_l2",
-                                  "method.thresh_high=3.0", "method.thresh_mid=1.0",
-                                  "imagination.horizons=[5,10,20]", "world_model.ensemble_size=2"]),
-        (3, "adaptive_5_10_20", ["method.uncertainty_metric=latent_mean_l2",
-                                  "method.thresh_high=3.0", "method.thresh_mid=1.0",
-                                  "imagination.horizons=[5,10,20]", "world_model.ensemble_size=3"]),
+        (1, "fixed_h20",      ["imagination.horizon_fixed=20", "world_model.ensemble_size=1"]),
+        (2, "fixed_h20",      ["imagination.horizon_fixed=20", "world_model.ensemble_size=2"]),
+        (2, "adaptive_10_15_20", _adaptive_ov),
     ]
     exps = []
     for _n, method, overrides in configs:
@@ -328,13 +441,13 @@ def make_ablation_threshold_experiments() -> List[Experiment]:
             exps.append(Experiment(
                 group="ablation_threshold",
                 env_id="Hopper-v4",
-                method="adaptive_5_10_20",
+                method="adaptive_10_15_20",
                 seed=seed,
                 extra_overrides=[
                     "method.uncertainty_metric=latent_mean_l2",
                     f"method.thresh_high={th}",
                     f"method.thresh_mid={tm}",
-                    "imagination.horizons=[5,10,20]",
+                    "imagination.horizons=[10,15,20]",
                 ] + SHARED_TRAINING_OVERRIDES,
             ))
     return exps
@@ -343,6 +456,7 @@ def make_ablation_threshold_experiments() -> List[Experiment]:
 # ── REGISTRY ───────────────────────────────────────────────────────────────────
 
 EXPERIMENT_GROUPS = {
+    "smoke":              make_smoke_experiments,       # quick 4-run sanity check
     "main":               make_main_experiments,
     "ablation_metric":    make_ablation_metric_experiments,
     "ablation_ensemble":  make_ablation_ensemble_experiments,

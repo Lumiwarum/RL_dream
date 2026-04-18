@@ -123,6 +123,14 @@ class Trainer:
         self.state        = TrainerState()
         self._return_scale = 1.0
         self.bad_eval_streak = 0
+        self._last_rollback_step = -1  # cooldown: prevents re-rollback within N steps
+        # EMA of WM obs_loss — used as the adaptive horizon uncertainty signal.
+        # Initialized high (2.0) so adaptive methods start with the short (cautious) horizon.
+        # Decays toward the true obs_loss with alpha=0.01 (~230 WM updates to converge).
+        self._ema_obs_loss: float = 2.0
+        # WM freeze after rollback: when > env_step, skip WM gradient updates so the
+        # restored WM weights are not immediately overwritten by fresh replay data.
+        self._wm_frozen_until: int = 0
 
         self.use_amp = (self.device.type == "cuda") and bool(getattr(cfg, "use_amp", False))
 
@@ -195,6 +203,20 @@ class Trainer:
         total_steps  = int(cfg.training.total_steps)
         chunk_steps  = int(cfg.training.steps_per_chunk)
         start_step   = int(self.state.env_step)
+
+        # Guard: if already at or past total_steps, the run is complete.
+        # With training.resume=true this happens when a completed run is relaunched
+        # without --skip_done. Print a clear message instead of silently exiting
+        # after the initial evaluate_deterministic() call (the "sanity check").
+        if start_step >= total_steps:
+            print(
+                f"[SKIP] Run already complete: env_step={start_step} >= total_steps={total_steps}."
+                f" Use --skip_done or increase training.total_steps to extend.",
+                flush=True,
+            )
+            self.close()
+            return
+
         chunk_idx    = start_step // chunk_steps
         end_step     = min(total_steps, (chunk_idx + 1) * chunk_steps)
 
@@ -206,6 +228,7 @@ class Trainer:
         min_steps_before_rollback = int(getattr(cfg.training, "min_steps_before_rollback", 500))
         rollback_lr_scale       = float(getattr(cfg.training, "rollback_lr_scale",      1.0))
         rollback_noise          = float(getattr(cfg.training, "rollback_noise_scale",   0.01))
+        rollback_cooldown       = int(getattr(cfg.training, "rollback_cooldown_steps",  30000))
 
         train_rollback_check   = bool(getattr(cfg.training, "train_rollback_check",   True))
         train_rollback_drop    = float(getattr(cfg.training, "train_rollback_drop",   20.0))
@@ -336,15 +359,27 @@ class Trainer:
                 and self.state.env_step % update_every == 0
             ):
                 for _ in range(int(cfg.training.updates_per_step)):
-                    wm_loss, kl_loss, obs_loss, rew_loss, sigreg_loss = update_world_model(
-                        ensemble=self.world_model_ensemble,
-                        replay=self.replay,
-                        wm_opt=self.wm_opt,
-                        sigreg=self.sigreg,
-                        cfg=cfg,
-                        device=self.device,
-                        use_amp=self.use_amp,
-                    )
+                    if self.state.env_step >= self._wm_frozen_until:
+                        wm_loss, kl_loss, obs_loss, rew_loss, sigreg_loss = update_world_model(
+                            ensemble=self.world_model_ensemble,
+                            replay=self.replay,
+                            wm_opt=self.wm_opt,
+                            sigreg=self.sigreg,
+                            cfg=cfg,
+                            device=self.device,
+                            use_amp=self.use_amp,
+                        )
+                        # EMA of obs_loss — used as the adaptive horizon uncertainty signal.
+                        # α=0.01 gives ~230 update steps to converge; well before actor_start_step.
+                        self._ema_obs_loss = 0.99 * self._ema_obs_loss + 0.01 * float(obs_loss)
+                    else:
+                        # WM is frozen post-rollback: skip gradient updates so the restored
+                        # WM weights are not overwritten by current replay data.
+                        # Carry forward the current EMA obs_loss for logging/horizon selection.
+                        wm_loss, kl_loss, obs_loss, rew_loss, sigreg_loss = (
+                            0.0, 0.0, self._ema_obs_loss, 0.0, 0.0
+                        )
+                        self.tb.scalar("wm/frozen", 1.0, int(self.state.env_step))
 
                     if self.state.env_step >= int(cfg.training.actor_start_step):
                         actor_loss, critic_loss, horizon_used, unc_mean, self._return_scale = update_actor_critic(
@@ -361,6 +396,7 @@ class Trainer:
                             tb_fn=self.tb.scalar,
                             step=int(self.state.env_step),
                             critic_ema=self._critic_ema,
+                            ema_obs_loss=self._ema_obs_loss,
                         )
                     else:
                         # WM warmup window: train critic without actor so it has a
@@ -377,6 +413,7 @@ class Trainer:
                             tb_fn=self.tb.scalar,
                             step=int(self.state.env_step),
                             critic_ema=self._critic_ema,
+                            ema_obs_loss=self._ema_obs_loss,
                         )
                         actor_loss, critic_loss, horizon_used, unc_mean = 0.0, 0.0, 0, 0.0
 
@@ -387,11 +424,12 @@ class Trainer:
                         train_time = max(1e-6, (time.time() - t0) - eval_time_total)
                         fps = (self.state.env_step - start_step) / train_time
                         self.tb.scalar("perf/fps",                  fps,          step)
-                        self.tb.scalar("loss/world_model",          wm_loss,      step)
-                        self.tb.scalar("loss/kl",                   kl_loss,      step)
-                        self.tb.scalar("loss/obs",                  obs_loss,     step)
-                        self.tb.scalar("loss/reward",               rew_loss,     step)
-                        self.tb.scalar("loss/sigreg",               sigreg_loss,  step)
+                        self.tb.scalar("loss/world_model",          wm_loss,              step)
+                        self.tb.scalar("loss/kl",                   kl_loss,              step)
+                        self.tb.scalar("loss/obs",                  obs_loss,             step)
+                        self.tb.scalar("loss/reward",               rew_loss,             step)
+                        self.tb.scalar("loss/sigreg",               sigreg_loss,          step)
+                        self.tb.scalar("wm/ema_obs_loss",           self._ema_obs_loss,   step)
                         self.tb.scalar("loss/actor",                actor_loss,   step)
                         self.tb.scalar("loss/critic",               critic_loss,  step)
                         self.tb.scalar("imagination/horizon_used",  horizon_used, step)
@@ -437,7 +475,10 @@ class Trainer:
                     self.tb.scalar("eval/bad_streak", float(self.bad_eval_streak), step)
 
                     if self.bad_eval_streak >= rollback_patience:
-                        self._do_rollback("best", rollback_noise, rollback_lr_scale)
+                        steps_since_last = self.state.env_step - self._last_rollback_step
+                        if steps_since_last >= rollback_cooldown:
+                            self._do_rollback("best", rollback_noise, rollback_lr_scale)
+                            self._last_rollback_step = self.state.env_step
                         self.bad_eval_streak = 0
 
         self.save_checkpoint(tag=f"step_{self.state.env_step}", make_latest=True)
@@ -467,10 +508,17 @@ class Trainer:
         if lr_scale != 1.0:
             for pg in self.actor_opt.param_groups:
                 pg["lr"] *= lr_scale
+        wm_freeze_steps = int(getattr(self.cfg.training, "wm_freeze_after_rollback", 0))
+        if wm_freeze_steps > 0:
+            self._wm_frozen_until = self.state.env_step + wm_freeze_steps
         print(f"[ROLLBACK/{tag}] step={current_step} ← ckpt_step={ckpt_step}, "
-              f"noise={noise_scale:.4f}, lr_scale={lr_scale}", flush=True)
+              f"noise={noise_scale:.4f}, lr_scale={lr_scale}"
+              + (f", wm_frozen_until={self._wm_frozen_until}" if wm_freeze_steps > 0 else ""),
+              flush=True)
         self.tb.scalar("rollback/event",    1.0,              current_step)
         self.tb.scalar("rollback/from_step", float(ckpt_step), current_step)
+        if wm_freeze_steps > 0:
+            self.tb.scalar("rollback/wm_frozen_until", float(self._wm_frozen_until), current_step)
 
     def close(self):
         if self.env is not None:

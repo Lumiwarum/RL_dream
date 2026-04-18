@@ -58,14 +58,36 @@ except ImportError:
     sys.exit(1)
 
 # Tags we care about — anything else is skipped without allocation.
+# Trainer logs both "imagination/*" and "imagine/*" (from actor_critic_updater),
+# so both prefix variants are listed.
 _WANTED_TAGS = frozenset([
+    # ── Evaluation ────────────────────────────────────────────────────────────
     "eval/return_mean", "eval/best_return",
+    # ── Training returns ──────────────────────────────────────────────────────
     "train/return_mean_20", "train/episode_return",
-    "eval/rollback", "train/rollback",
-    "imagine/horizon_used", "imagine/uncertainty_mean", "imagine/cont_prob_mean",
+    # ── Rollback events ───────────────────────────────────────────────────────
+    "eval/rollback", "train/rollback", "train/bad_streak",
+    "rollback/event", "rollback/from_step",  # new per-rollback markers
+    "wm/ema_obs_loss",   # EMA of obs_loss — the adaptive horizon signal
+    "wm/frozen",         # 1.0 when WM updates are suppressed post-rollback
+    # ── World model losses (trainer logs all components) ──────────────────────
+    "loss/world_model",   # total
+    "loss/kl",            # KL(posterior || prior) — should trend to free_nats floor
+    "loss/obs",           # observation reconstruction MSE — main learning signal
+    "loss/reward",        # reward head MSE — should decrease quickly
+    "loss/sigreg",        # SIGReg marginal regulariser — should stay small
+    "loss/actor",         # actor loss (negative advantage / rscale - entropy)
+    "loss/critic",        # critic Huber loss
+    # ── Imagination / horizon ─────────────────────────────────────────────────
+    "imagine/horizon_used",      "imagination/horizon_used",
+    "imagine/uncertainty_mean",  "imagination/uncertainty_mean",
+    "imagine/cont_prob_mean",    "imagine/cont_prob",
+    # ── Policy ────────────────────────────────────────────────────────────────
     "policy/std_mean", "policy/entropy_gaussian",
-    "grad/actor_norm", "loss/world_model",
-    "value/return_scale",
+    # ── Gradients ─────────────────────────────────────────────────────────────
+    "grad/actor_norm", "grad/critic_norm",
+    # ── Value / return scale ──────────────────────────────────────────────────
+    "value/return_scale", "value/bootstrap",
 ])
 _MAX_PER_TAG = 2000   # deque maxlen — keeps the newest N points
 
@@ -140,7 +162,7 @@ def _parse_name(name: str):
 
 # ── per-run summary ────────────────────────────────────────────────────────────
 
-_CACHE_VERSION = 4   # bumped: switched from EventAccumulator to EventFileLoader
+_CACHE_VERSION = 6   # bumped: added ema_obs_loss, rollback/event, wm/frozen tags
 
 
 def _stream_scalars(tb_dir: Path) -> Optional[dict]:
@@ -315,8 +337,11 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
     spike = False
     if max_eval is not None and final_eval is not None:
         drop     = max_eval - final_eval
-        max_step = max(last_s("eval/return_mean"), 1)
-        spike    = (drop > 30) and (max_step_at is not None) and (max_step_at < max_step * 0.5)
+        # Flag spike-then-drop if the peak was at least 30 above final eval AND
+        # represents a meaningful fraction of the peak (not just noise).
+        # Removed the max_step_at < 0.5*total guard: spikes in the second half of
+        # training are equally real (e.g. Walker2d/adaptive/s1: peak=317@317k, final=-22).
+        spike    = (drop > 30) and (max_eval is not None) and (max_eval > 0) and (max_step_at is not None)
 
     plateau = float(np.std(_tail(eval_ret, 10))) if len(eval_ret) >= 10 else None
 
@@ -329,6 +354,12 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
     _, rb_eval  = get("eval/rollback")
     _, rb_train = get("train/rollback")
     n_rollbacks = int(rb_eval.sum() + rb_train.sum()) if (len(rb_eval) + len(rb_train)) > 0 else 0
+    # New per-rollback markers (more reliable than the old aggregate counters)
+    rb_steps, rb_events = get("rollback/event")
+    n_rollback_events   = int(rb_events.sum()) if len(rb_events) > 0 else n_rollbacks
+    rb_from_steps, _    = get("rollback/from_step")
+    _, wm_frozen_v      = get("wm/frozen")
+    wm_frozen_count     = int(wm_frozen_v.sum()) if len(wm_frozen_v) > 0 else 0
 
     # ── imagination / horizon ─────────────────────────────────────────────────
     hor_vals  = tl("imagine/horizon_used")
@@ -338,6 +369,13 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
     mean_unc  = float(np.mean(unc_vals))  if len(unc_vals) else None
     mean_cont = float(np.mean(cont_vals)) if len(cont_vals) else None
     h_min_pct = float(np.mean(hor_vals == hor_vals.min())) * 100 if len(hor_vals) else None
+    # Per-horizon percentages (for adaptive runs with H=10/H=15/H=20)
+    h_pct = {}
+    if len(hor_vals) > 0:
+        for h in [5, 10, 15, 20]:
+            pct = float(np.mean(hor_vals == h)) * 100
+            if pct > 0:
+                h_pct[h] = pct
 
     # ── policy ────────────────────────────────────────────────────────────────
     std_vals  = tl("policy/std_mean")
@@ -354,6 +392,13 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
     _, rscale_all = get("value/return_scale")
     mean_rscale   = float(np.mean(_tail(rscale_all, last_n))) if len(rscale_all) else None
     max_rscale    = float(np.max(rscale_all))                 if len(rscale_all) else None
+    # rscale capped fraction: how often rscale > 95 (out of all logged steps)
+    rscale_capped_pct = (float(np.mean(rscale_all > 95)) * 100) if len(rscale_all) > 10 else None
+
+    # ── EMA obs_loss (adaptive horizon signal) ────────────────────────────────
+    ema_steps, ema_obs_vals = get("wm/ema_obs_loss")
+    ema_obs_early = float(np.mean(_head(ema_obs_vals, max(1, len(ema_obs_vals)//3)))) if len(ema_obs_vals) >= 3 else None
+    ema_obs_late  = float(np.mean(_tail(ema_obs_vals, max(1, len(ema_obs_vals)//3)))) if len(ema_obs_vals) >= 3 else None
 
     max_step = max(last_s("eval/return_mean"),
                    last_s("imagine/horizon_used"),
@@ -363,11 +408,17 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
 
     # ── problem flags ─────────────────────────────────────────────────────────
     problems = []
-    if h_min_pct is not None and h_min_pct > 90 and method == "adaptive":
+    # HORIZON_STUCK: only fire when WM is confident (low unc) but still using minimum
+    # horizon. This is a genuine bug (WM good but not using long horizon).
+    # H=10:100% with unc>0.90 is CORRECT (high WM uncertainty → short horizon by design).
+    # H=15:100% or H=20:100% are always correct (mid/max horizon = working as intended).
+    if (h_min_pct is not None and h_min_pct > 90 and method == "adaptive"
+            and mean_hor is not None and mean_hor <= 10
+            and mean_unc is not None and mean_unc < 0.5):
         problems.append(f"HORIZON_STUCK@{h_min_pct:.0f}%_min")
-    if mean_act_g is not None and mean_act_g < 0.02:
+    if mean_act_g is not None and mean_act_g < 0.01:
         problems.append(f"ACTOR_GRAD_TINY({mean_act_g:.4f})")
-    if mean_std is not None and mean_std < 0.40:
+    if mean_std is not None and mean_std < 0.15:
         problems.append(f"STD_COLLAPSED({mean_std:.3f})")
     if mean_std is not None and mean_std > 1.30:
         problems.append(f"STD_HIGH({mean_std:.3f})")
@@ -379,11 +430,17 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
         problems.append(f"SPIKE_THEN_DROP(peak={max_eval:.0f}@{max_step_at//1000}k→now={final_eval:.0f})")
     if max_rscale is not None and max_rscale > 200.0:
         problems.append(f"VALUE_DIVERGE(rscale_max={max_rscale:.0f})")
+    if rscale_capped_pct is not None and rscale_capped_pct > 50.0:
+        problems.append(f"RSCALE_CAPPED_PERSISTENT({rscale_capped_pct:.0f}%>95)")
     _cont_thresh = CONT_THRESHOLDS.get(method, 0.70)
     if mean_cont is not None and mean_cont < _cont_thresh:
         problems.append(f"CONT_LOW({mean_cont:.2f}<{_cont_thresh})")
-    if n_rollbacks > 0:
-        problems.append(f"ROLLBACKS={n_rollbacks}")
+    if n_rollback_events > 0:
+        problems.append(f"ROLLBACKS={n_rollback_events}")
+    # EMA obs_loss stuck: for adaptive runs, if ema_obs_late is above the high threshold
+    # the whole run, horizon can never progress past H_min.
+    if ema_obs_late is not None and method == "adaptive" and ema_obs_late > 0.25:
+        problems.append(f"EMA_OBS_HIGH(late={ema_obs_late:.3f})")  # Hopper: thresh=0.28
 
     return {
         "run_dir":      run_dir.name,
@@ -407,11 +464,16 @@ def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
         "actor_grad":   mean_act_g,
         "return_scale": mean_rscale,
         "max_rscale":   max_rscale,
-        "wm_loss":      mean_wm,
-        "n_rollbacks":  n_rollbacks,
-        "problems":     problems,
-        "_eval_steps":  eval_steps,
-        "_eval_ret":    eval_ret,
+        "wm_loss":            mean_wm,
+        "n_rollbacks":        n_rollback_events,
+        "wm_frozen_count":    wm_frozen_count,
+        "rscale_capped_pct":  rscale_capped_pct,
+        "ema_obs_early":      ema_obs_early,
+        "ema_obs_late":       ema_obs_late,
+        "h_pct":              h_pct,
+        "problems":           problems,
+        "_eval_steps":        eval_steps,
+        "_eval_ret":          eval_ret,
     }
 
 
@@ -506,14 +568,18 @@ def main():
     print(
         f"{'RUN':<{W}} {'STEPS':>8} {'F_EVAL':>7} {'MAX_E':>7} {'TRAIN_R':>8} "
         f"{'CONT_P':>7} {'H_MEAN':>7} {'UNC':>7} "
-        f"{'STD':>5} {'ACT_G':>6} {'RSCALE':>9}  PROBLEMS"
+        f"{'EMA_OBS':>8} {'STD':>5} {'ACT_G':>6} {'RSCALE%CAP':>10}  PROBLEMS"
     )
-    print("─" * 180)
+    print("─" * 190)
 
     for r in results:
         label = _run_label(r)
         probs_str = "  ".join(r["problems"]) if r["problems"] else "OK"
         spike_marker = "▲▼" if r["spike"] else "  "
+        # Show ema_obs_late if available, else "-"
+        ema_str = _fmt(r.get("ema_obs_late"), 3) if r.get("ema_obs_late") is not None else "-"
+        cap_pct = r.get("rscale_capped_pct")
+        cap_str = f"{cap_pct:.0f}%" if cap_pct is not None else "-"
         print(
             f"{label:<{W}} "
             f"{r['max_step']:>8,} "
@@ -523,9 +589,10 @@ def main():
             f"{_fmt(r['mean_cont'],   2):>7} "
             f"{_fmt(r['mean_horizon'],1):>7} "
             f"{_fmt(r['mean_unc'],    2):>7} "
+            f"{ema_str:>8} "
             f"{_fmt(r['mean_std'],    2):>5} "
             f"{_fmt(r['actor_grad'],  3):>6} "
-            f"{_fmt(r['max_rscale'],  0):>9}  "
+            f"{cap_str:>10}  "
             f"{probs_str}"
         )
 

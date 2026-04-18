@@ -234,7 +234,8 @@ def compute_final_stats(runs: Dict[str, dict],
 
 def compute_horizon_dist(runs: Dict[str, dict]) -> Dict[str, Dict[str, dict]]:
     """
-    For adaptive runs: {env: {seed_name: {"H=5": pct, "H=10": pct, "H=20": pct, "uncertainty": float}}}
+    For adaptive runs: per-seed horizon % distribution + EMA obs_loss stats.
+    Supports both legacy H=5/10/20 and current H=10/15/20 candidates.
     """
     dist: Dict[str, Dict[str, dict]] = defaultdict(dict)
 
@@ -246,19 +247,44 @@ def compute_horizon_dist(runs: Dict[str, dict]) -> Dict[str, Dict[str, dict]]:
         arrays = info["arrays"]
 
         h_steps, h_vals = arrays.get("imagine/horizon_used", (np.array([]), np.array([])))
+        if len(h_vals) == 0:
+            # try alternative tag
+            h_steps, h_vals = arrays.get("imagination/horizon_used", (np.array([]), np.array([])))
         u_steps, u_vals = arrays.get("imagine/uncertainty_mean", (np.array([]), np.array([])))
+        ema_steps, ema_vals = arrays.get("wm/ema_obs_loss", (np.array([]), np.array([])))
 
         if len(h_vals) == 0:
             continue
 
         total = len(h_vals)
         h_dist = {}
-        for h in [5, 10, 20]:
-            h_dist[f"H={h}"] = float(np.sum(h_vals == h) / total * 100)
+        for h in [5, 10, 15, 20]:
+            pct = float(np.sum(h_vals == h) / total * 100)
+            if pct > 0:
+                h_dist[f"H={h}"] = pct
 
         unc = float(np.median(u_vals)) if len(u_vals) > 0 else float("nan")
-        dist[env][f"s{seed}"] = {**h_dist, "uncertainty_med": unc,
-                                  "h_avg": float(np.mean(h_vals))}
+        n3 = max(1, len(h_vals) // 3)
+        h_early = float(np.mean(h_vals[:n3]))
+        h_late  = float(np.mean(h_vals[-n3:]))
+
+        ema_early = float(np.mean(ema_vals[:max(1, len(ema_vals)//3)])) if len(ema_vals) >= 3 else float("nan")
+        ema_late  = float(np.mean(ema_vals[-max(1, len(ema_vals)//3):])) if len(ema_vals) >= 3 else float("nan")
+
+        dist[env][f"s{seed}"] = {
+            **h_dist,
+            "uncertainty_med": unc,
+            "h_avg":   float(np.mean(h_vals)),
+            "h_early": h_early,
+            "h_late":  h_late,
+            "ema_obs_early": ema_early,
+            "ema_obs_late":  ema_late,
+            # raw arrays for timeline plots
+            "_h_steps": h_steps,
+            "_h_vals":  h_vals,
+            "_ema_steps": ema_steps,
+            "_ema_vals":  ema_vals,
+        }
     return dict(dist)
 
 
@@ -317,48 +343,238 @@ def plot_training_curves(curves: Dict[str, Dict[str, dict]],
 
 def plot_horizon_dist(dist: Dict[str, Dict[str, dict]],
                       fig_dir: Path, save: bool = True) -> None:
-    """Bar chart: horizon usage (H=5/10/20) for each adaptive run."""
+    """Stacked bar chart: horizon usage % for each adaptive run (H=10/H=15/H=20)."""
     if not HAS_MPL or not dist:
         return
 
     all_runs = [(env, seed_key, info)
                 for env, seeds in dist.items()
                 for seed_key, info in seeds.items()]
-
     if not all_runs:
         return
 
-    labels = [f"{env}/{sk}" for env, sk, _ in all_runs]
-    h5_pcts  = [info["H=5"]  for _, _, info in all_runs]
-    h10_pcts = [info["H=10"] for _, _, info in all_runs]
-    h20_pcts = [info["H=20"] for _, _, info in all_runs]
+    # Detect which horizons are actually used across runs
+    all_horizons = sorted({int(k[2:]) for _, _, info in all_runs
+                           for k in info if k.startswith("H=")})
+    horizon_colors = {5: "#d62728", 10: "#ff7f0e", 15: "#9467bd", 20: "#1f77b4"}
 
+    labels = [f"{env}/{sk}" for env, sk, _ in all_runs]
     x = np.arange(len(labels))
     width = 0.6
 
-    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.1), 4))
-    b5  = ax.bar(x, h5_pcts,  width, label="H=5",  color="#d62728")
-    b10 = ax.bar(x, h10_pcts, width, bottom=h5_pcts, label="H=10", color="#ff7f0e")
-    b20 = ax.bar(x, h20_pcts, width,
-                 bottom=np.array(h5_pcts) + np.array(h10_pcts),
-                 label="H=20", color="#1f77b4")
+    fig, ax = plt.subplots(figsize=(max(7, len(labels) * 1.3), 4.5))
+    bottoms = np.zeros(len(all_runs))
+    for h in all_horizons:
+        pcts = [info.get(f"H={h}", 0.0) for _, _, info in all_runs]
+        ax.bar(x, pcts, width, bottom=bottoms, label=f"H={h}",
+               color=horizon_colors.get(h, "#888888"))
+        bottoms += np.array(pcts)
 
-    # Annotate with median uncertainty
+    # Annotate with ema_obs_late and horizon trend
     for i, (_, _, info) in enumerate(all_runs):
-        u = info.get("uncertainty_med", float("nan"))
-        if np.isfinite(u):
-            ax.text(i, 103, f"ū={u:.2f}", ha="center", va="bottom", fontsize=8, rotation=45)
+        ema_late = info.get("ema_obs_late", float("nan"))
+        h_e = info.get("h_early", float("nan"))
+        h_l = info.get("h_late",  float("nan"))
+        if np.isfinite(ema_late):
+            ax.text(i, 102, f"obs={ema_late:.2f}", ha="center", va="bottom",
+                    fontsize=7, rotation=45, color="#333333")
+        if np.isfinite(h_e) and np.isfinite(h_l):
+            trend = "↑" if h_l > h_e + 0.5 else ("↓" if h_l < h_e - 0.5 else "→")
+            ax.text(i, 109, f"{h_e:.0f}→{h_l:.0f}{trend}", ha="center", va="bottom",
+                    fontsize=7, rotation=45, color="#555555")
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel("% of actor-critic updates", fontsize=11)
-    ax.set_ylim(0, 120)
-    ax.set_title("Adaptive Horizon Distribution per Run", fontsize=12)
-    ax.legend(loc="upper right")
+    ax.set_ylabel("% of AC updates", fontsize=11)
+    ax.set_ylim(0, 125)
+    ax.set_title("Adaptive Horizon Distribution per Run\n(annotated with ema_obs_loss late-phase and early→late horizon trend)", fontsize=11)
+    ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()
     out = fig_dir / "horizon_dist.pdf"
+    if save:
+        plt.savefig(out, bbox_inches="tight")
+        print(f"  Saved {out}")
+    else:
+        plt.show()
+    plt.close()
+
+
+def plot_horizon_timeline(dist: Dict[str, Dict[str, dict]],
+                          fig_dir: Path, save: bool = True) -> None:
+    """
+    For each adaptive run: dual-axis plot of EMA obs_loss (left) and horizon used (right)
+    over training steps. Shows whether the adaptive signal is actually driving horizon switches.
+    """
+    if not HAS_MPL or not dist:
+        return
+
+    horizon_colors = {10: "#ff7f0e", 15: "#9467bd", 20: "#1f77b4"}
+    env_thresholds = {
+        "Hopper":   (0.28, 0.17, "Hopper: 0.28/0.17"),
+        "Walker2d": (1.50, 1.00, "Walker2d: 1.50/1.00"),
+    }
+
+    all_runs = [(env, sk, info)
+                for env, seeds in dist.items()
+                for sk, info in seeds.items()]
+    if not all_runs:
+        return
+
+    ncols = min(3, len(all_runs))
+    nrows = (len(all_runs) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.5 * nrows), squeeze=False)
+
+    for idx, (env, sk, info) in enumerate(all_runs):
+        ax = axes[idx // ncols][idx % ncols]
+        ax2 = ax.twinx()
+
+        ema_steps = info.get("_ema_steps", np.array([]))
+        ema_vals  = info.get("_ema_vals",  np.array([]))
+        h_steps   = info.get("_h_steps",   np.array([]))
+        h_vals    = info.get("_h_vals",    np.array([]))
+
+        if len(ema_vals) > 0:
+            ax.plot(ema_steps / 1e3, ema_vals, color="#2ca02c", linewidth=1.5,
+                    alpha=0.8, label="EMA obs_loss")
+            thresh_h, thresh_m, thresh_label = env_thresholds.get(env, (0.28, 0.17, ""))
+            ax.axhline(thresh_h, color="red",    linestyle="--", linewidth=0.8, alpha=0.6,
+                       label=f"thresh_high={thresh_h}")
+            ax.axhline(thresh_m, color="orange", linestyle="--", linewidth=0.8, alpha=0.6,
+                       label=f"thresh_mid={thresh_m}")
+            ax.set_ylabel("EMA obs_loss", fontsize=9, color="#2ca02c")
+            ax.tick_params(axis="y", labelcolor="#2ca02c", labelsize=8)
+
+        if len(h_vals) > 0:
+            ax2.scatter(h_steps / 1e3, h_vals, c=[horizon_colors.get(int(h), "#888888") for h in h_vals],
+                        s=3, alpha=0.4, zorder=2)
+            ax2.set_ylabel("Horizon used", fontsize=9, color="#1f77b4")
+            ax2.tick_params(axis="y", labelcolor="#1f77b4", labelsize=8)
+            ax2.set_ylim(5, 25)
+            ax2.set_yticks([10, 15, 20])
+
+        ax.set_title(f"{env}/{sk}", fontsize=10)
+        ax.set_xlabel("Steps (×10³)", fontsize=8)
+        ax.grid(True, alpha=0.2)
+
+    # Hide unused subplots
+    for idx in range(len(all_runs), nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    # Legend on first subplot
+    if all_runs:
+        axes[0][0].legend(fontsize=7, loc="upper right")
+
+    plt.suptitle("EMA obs_loss vs Horizon Selection (adaptive runs)", fontsize=12)
+    plt.tight_layout()
+    out = fig_dir / "horizon_timeline.pdf"
+    if save:
+        plt.savefig(out, bbox_inches="tight")
+        print(f"  Saved {out}")
+    else:
+        plt.show()
+    plt.close()
+
+
+def plot_per_seed_curves(runs: Dict[str, dict],
+                         tag: str = "eval/return_mean",
+                         fig_dir: Path = Path("."),
+                         save: bool = True) -> None:
+    """
+    Individual seed trajectories (thin lines) + mean (thick line) per method and env.
+    Supplements plot_training_curves to show variance structure.
+    """
+    if not HAS_MPL:
+        return
+
+    curves = build_curves(runs, tag=tag, n_grid=200)
+    envs = [e for e in ENV_ORDER if e in curves]
+    if not envs:
+        return
+
+    fig, axes = plt.subplots(1, len(envs), figsize=(6 * len(envs), 4.5))
+    if len(envs) == 1:
+        axes = [axes]
+
+    for ax, env in zip(axes, envs):
+        for method in METHOD_ORDER:
+            if method not in curves.get(env, {}):
+                continue
+            c = curves[env][method]
+            color = METHOD_COLORS[method]
+            ls    = METHOD_LS[method]
+            steps_k = c["steps"] / 1_000
+
+            # Individual seeds (thin)
+            for seed_arr in c["seeds"]:
+                ax.plot(steps_k, seed_arr, color=color, linestyle=ls,
+                        linewidth=0.7, alpha=0.35)
+            # Mean (thick)
+            ax.plot(steps_k, c["mean"], color=color, linestyle=ls,
+                    linewidth=2.2, label=f"{METHOD_LABELS[method]} (n={c['n']})")
+
+        ax.set_title(env, fontsize=13)
+        ax.set_xlabel("Environment steps (×10³)", fontsize=11)
+        ax.set_ylabel("Eval return", fontsize=11)
+        ax.legend(fontsize=9, loc="upper left")
+        ax.grid(True, alpha=0.3)
+        ax.axhline(0, color="black", linewidth=0.5, alpha=0.4)
+
+    plt.suptitle("Per-seed Evaluation Return (thin=individual, thick=mean)", fontsize=12)
+    plt.tight_layout()
+    out = fig_dir / "training_curves_per_seed.pdf"
+    if save:
+        plt.savefig(out, bbox_inches="tight")
+        print(f"  Saved {out}")
+    else:
+        plt.show()
+    plt.close()
+
+
+def plot_rscale_trajectory(runs: Dict[str, dict],
+                           fig_dir: Path, save: bool = True) -> None:
+    """
+    Return scale over training steps per method per env.
+    Shows when rscale hits the 100 cap and whether it recovers.
+    """
+    if not HAS_MPL:
+        return
+
+    curves = build_curves(runs, tag="value/return_scale", n_grid=200)
+    envs = [e for e in ENV_ORDER if e in curves]
+    if not envs:
+        print("  [WARN] No return_scale data found.")
+        return
+
+    fig, axes = plt.subplots(1, len(envs), figsize=(6 * len(envs), 4))
+    if len(envs) == 1:
+        axes = [axes]
+
+    for ax, env in zip(axes, envs):
+        for method in METHOD_ORDER:
+            c = curves.get(env, {}).get(method)
+            if c is None:
+                continue
+            color = METHOD_COLORS[method]
+            ls    = METHOD_LS[method]
+            steps_k = c["steps"] / 1_000
+            ax.plot(steps_k, c["mean"], color=color, linestyle=ls,
+                    linewidth=2.0, label=METHOD_LABELS[method])
+            ax.fill_between(steps_k, c["mean"] - c["std"], c["mean"] + c["std"],
+                            alpha=0.1, color=color)
+
+        ax.axhline(100, color="red", linestyle="--", linewidth=1.2, alpha=0.7, label="cap (100)")
+        ax.set_title(env, fontsize=13)
+        ax.set_xlabel("Steps (×10³)", fontsize=11)
+        ax.set_ylabel("Return scale (EMA p95−p5)", fontsize=10)
+        ax.set_ylim(0, 130)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle("Return Scale Trajectory (cap=100 → actor gradients compressed)", fontsize=12)
+    plt.tight_layout()
+    out = fig_dir / "rscale_trajectory.pdf"
     if save:
         plt.savefig(out, bbox_inches="tight")
         print(f"  Saved {out}")
@@ -492,12 +708,12 @@ def write_horizon_table(dist: Dict[str, Dict[str, dict]],
         "% Auto-generated by make_thesis_figures.py",
         "\\begin{table}[t]",
         "  \\centering",
-        "  \\caption{Horizon selection distribution for adaptive runs.}",
+        "  \\caption{Horizon selection distribution for adaptive runs (H=10/H=15/H=20 candidates).}",
         "  \\label{tab:horizon_dist}",
-        "  \\begin{tabular}{llccccc}",
+        "  \\begin{tabular}{llcccccc}",
         "    \\toprule",
-        "    Env & Seed & H=5 (\\%) & H=10 (\\%) & H=20 (\\%) & "
-        "$\\bar{H}$ & $\\bar{u}$ (med) \\\\",
+        "    Env & Seed & H=10 (\\%) & H=15 (\\%) & H=20 (\\%) & "
+        "$\\bar{H}_{early}$ & $\\bar{H}_{late}$ & obs$_{late}$ \\\\",
         "    \\midrule",
     ]
 
@@ -506,14 +722,15 @@ def write_horizon_table(dist: Dict[str, Dict[str, dict]],
             continue
         for seed_key in sorted(dist[env].keys()):
             info = dist[env][seed_key]
-            h5  = info.get("H=5",  0.0)
-            h10 = info.get("H=10", 0.0)
-            h20 = info.get("H=20", 0.0)
-            havg = info.get("h_avg", float("nan"))
-            unc  = info.get("uncertainty_med", float("nan"))
+            h10  = info.get("H=10", 0.0)
+            h15  = info.get("H=15", 0.0)
+            h20  = info.get("H=20", 0.0)
+            h_e  = info.get("h_early", float("nan"))
+            h_l  = info.get("h_late",  float("nan"))
+            ema_l = info.get("ema_obs_late", float("nan"))
             lines.append(
-                f"    {env} & {seed_key} & {h5:.1f} & {h10:.1f} & {h20:.1f} & "
-                f"{havg:.1f} & {unc:.3f} \\\\"
+                f"    {env} & {seed_key} & {h10:.1f} & {h15:.1f} & {h20:.1f} & "
+                f"{h_e:.1f} & {h_l:.1f} & {ema_l:.3f} \\\\"
             )
     lines += [
         "    \\bottomrule",
@@ -621,11 +838,16 @@ def write_text_summary(stats: Dict[str, Dict[str, dict]],
             if env not in dist:
                 continue
             for sk, info in sorted(dist[env].items()):
-                lines.append(
-                    f"  {env}/{sk}: H=5:{info['H=5']:.0f}%  H=10:{info['H=10']:.0f}%  "
-                    f"H=20:{info['H=20']:.0f}%  ū={info['uncertainty_med']:.3f}  "
-                    f"H̄={info['h_avg']:.1f}"
+                h_parts = "  ".join(
+                    f"H={h}:{info[f'H={h}']:.0f}%"
+                    for h in [10, 15, 20] if f"H={h}" in info
                 )
+                h_early = info.get("h_early", float("nan"))
+                h_late  = info.get("h_late",  float("nan"))
+                ema_late = info.get("ema_obs_late", float("nan"))
+                trend = f"  H:{h_early:.0f}→{h_late:.0f}" if (np.isfinite(h_early) and np.isfinite(h_late)) else ""
+                obs_str = f"  ema_obs_late={ema_late:.3f}" if np.isfinite(ema_late) else ""
+                lines.append(f"  {env}/{sk}: {h_parts}{trend}{obs_str}")
         lines.append("")
 
     # Did adaptive help?
@@ -697,8 +919,11 @@ def main():
     print("\nGenerating figures …")
     save = not args.no_save
     plot_training_curves(curves, fig_dir, save=save)
+    plot_per_seed_curves(runs, fig_dir=fig_dir, save=save)
     plot_horizon_dist(dist, fig_dir, save=save)
+    plot_horizon_timeline(dist, fig_dir, save=save)
     plot_rscale_vs_return(runs, fig_dir, save=save)
+    plot_rscale_trajectory(runs, fig_dir, save=save)
 
     # 4. Tables
     print("\nGenerating tables …")

@@ -62,14 +62,23 @@ agent:
   return_scale_max: 100.0
 
 method:
-  name: "fixed_h20"  # fixed_h5 | fixed_h15 | fixed_h20 | adaptive_5_10_20
-  # adaptive horizon selection thresholds based on uncertainty scalar
-  # if uncertainty > high -> H=5
-  # elif uncertainty > mid -> H=10
-  # else -> H=20
-  uncertainty_metric: "next_obs_mean_l2"  # latent_mean_l2 | next_obs_mean_l2 | gaussian_kl
-  thresh_high: 0.25
-  thresh_mid: 0.10
+  name: "fixed_h20"  # fixed_h5 | fixed_h15 | fixed_h20 | adaptive_10_15_20
+  # ── Ensemble-disagreement uncertainty (original signal) ──────────────────────
+  # Measures latent_mean_l2 between the two WM ensemble members' next-latent predictions.
+  # Problem: settles to a stable per-seed value within ~500 WM updates → each run
+  # locks to exactly one horizon for the whole training run (no within-run switching).
+  uncertainty_metric: "latent_mean_l2"   # latent_mean_l2 | next_obs_mean_l2 | gaussian_kl
+  thresh_high: 0.90
+  thresh_mid: 0.55
+  # ── WM-loss uncertainty (dynamic signal) ─────────────────────────────────────
+  # Uses EMA of WM obs_loss as the horizon selector instead of ensemble disagreement.
+  # This signal varies throughout training: high early (WM still learning), low late
+  # (WM converged) → gives genuine within-run horizon switching.
+  # Enable with use_obs_loss_unc=true in adaptive experiment overrides.
+  use_obs_loss_unc: false
+  obs_loss_thresh_high: 0.30   # obs_loss above this → H=horizons[0] (short, cautious)
+  obs_loss_thresh_mid:  0.18   # obs_loss above this → H=horizons[1] (mid)
+                               # obs_loss below this → H=horizons[2] (long, confident)
 
 imagination:
   horizon_fixed: 20          # used for fixed baselines (e.g., fixed_h15)
@@ -112,6 +121,8 @@ training:
   min_steps_before_rollback: 400
   rollback_lr_scale: 0.9
   rollback_noise_scale: 0.01
+  rollback_cooldown_steps: 30000  # min steps between rollbacks; prevents re-triggering loops
+  wm_freeze_after_rollback: 0    # steps to freeze WM updates after rollback (0=disabled)
 
   # Training-based early rollback (checked every episode)
   train_rollback_check: true
