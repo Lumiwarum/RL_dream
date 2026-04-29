@@ -1,706 +1,272 @@
-"""
-scan_logs.py — Scan all TensorBoard logs and print a diagnostic summary table.
-
-Reads every run under runs/<exp_name>/tb/ and extracts key metrics to identify:
-  - Overall learning progress (eval + train return)
-  - Spike-then-drop (peak achieved early then regressed)
-  - Adaptive horizon behaviour (stuck at H_min = adaptive not working)
-  - Actor / WM health
-  - Continue probability (should be >0.9 after cont_target fix)
-  - Rollback events
+"""TensorBoard log scanner.
 
 Usage:
-    python scripts/scan_logs.py                         # all runs
-    python scripts/scan_logs.py --filter hopper         # subset
-    python scripts/scan_logs.py --sort max_eval         # sort column
-    python scripts/scan_logs.py --last_n 50             # use last N points for stats
-    python scripts/scan_logs.py --csv out.csv           # also write CSV
-    python scripts/scan_logs.py --curve                 # print learning curves
+    python scripts/scan_logs.py
+    python scripts/scan_logs.py --filter hopper --sort eval/return_mean
+    python scripts/scan_logs.py --last_n 50 --csv out.csv
+    python scripts/scan_logs.py --filter adaptive --sort eval/return_mean --last_n 100
 """
-from __future__ import annotations
-
 import argparse
-import csv
 import json
 import os
-import sys
-import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
-
-import numpy as np
-
-try:
-    from tqdm import tqdm as _tqdm
-except ImportError:
-    def _tqdm(it, **kwargs):  # type: ignore[misc]
-        desc = kwargs.get("desc", "")
-        total = kwargs.get("total", "?")
-        print(f"{desc} ({total} items) …", flush=True)
-        return it
 
 ROOT = Path(__file__).resolve().parent.parent
+RUNS_DIR = ROOT / "runs"
 
-# Cont thresholds: cont_disc_floor=0.9 clamps the imagination discount regardless of
-# what the WM predicts, so low cont_prob no longer collapses learning.
-# These thresholds only flag genuine cont head failure (stuck near 0).
-CONT_THRESHOLDS = {
-    "fixed_h5": 0.50, "fixed_h10": 0.45, "fixed_h15": 0.40,
-    "fixed_h20": 0.35, "adaptive": 0.45,
-}
-sys.path.insert(0, str(ROOT))
+WANTED_TAGS = [
+    "eval/return_mean",
+    "eval/return_std",
+    "loss/obs",
+    "loss/obs_prior",
+    "loss/kl",
+    "loss/reward",
+    "wm/ema_obs_loss",
+    "policy/std_mean",
+    "actor/grad_norm",
+    "imagine/horizon",
+    "imagine/uncertainty",
+    "value/return_scale",
+    # r2dreamer-mapped names
+    "train/loss/obs",
+    "train/loss/rep",
+    "train/loss/dyn",
+    "train/loss/rew",
+    "train/loss/policy",
+    "train/wm/prior_pred_loss",
+    "train/wm/ema_obs_loss",
+    "train/imagine/horizon",
+    "train/action_entropy",
+    "train/ret",
+    "train/val",
+]
 
-try:
-    from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
-except ImportError:
-    print("[ERROR] tensorboard not installed.  pip install tensorboard")
-    sys.exit(1)
-
-# Tags we care about — anything else is skipped without allocation.
-# Trainer logs both "imagination/*" and "imagine/*" (from actor_critic_updater),
-# so both prefix variants are listed.
-_WANTED_TAGS = frozenset([
-    # ── Evaluation ────────────────────────────────────────────────────────────
-    "eval/return_mean", "eval/best_return",
-    # ── Training returns ──────────────────────────────────────────────────────
-    "train/return_mean_20", "train/episode_return",
-    # ── Rollback events ───────────────────────────────────────────────────────
-    "eval/rollback", "train/rollback", "train/bad_streak",
-    "rollback/event", "rollback/from_step",  # new per-rollback markers
-    "wm/ema_obs_loss",   # EMA of obs_loss — the adaptive horizon signal
-    "wm/frozen",         # 1.0 when WM updates are suppressed post-rollback
-    # ── World model losses (trainer logs all components) ──────────────────────
-    "loss/world_model",   # total
-    "loss/kl",            # KL(posterior || prior) — should trend to free_nats floor
-    "loss/obs",           # observation reconstruction MSE — main learning signal
-    "loss/reward",        # reward head MSE — should decrease quickly
-    "loss/sigreg",        # SIGReg marginal regulariser — should stay small
-    "loss/actor",         # actor loss (negative advantage / rscale - entropy)
-    "loss/critic",        # critic Huber loss
-    # ── Imagination / horizon ─────────────────────────────────────────────────
-    "imagine/horizon_used",      "imagination/horizon_used",
-    "imagine/uncertainty_mean",  "imagination/uncertainty_mean",
-    "imagine/cont_prob_mean",    "imagine/cont_prob",
-    # ── Policy ────────────────────────────────────────────────────────────────
-    "policy/std_mean", "policy/entropy_gaussian",
-    # ── Gradients ─────────────────────────────────────────────────────────────
-    "grad/actor_norm", "grad/critic_norm",
-    # ── Value / return scale ──────────────────────────────────────────────────
-    "value/return_scale", "value/bootstrap",
-])
-_MAX_PER_TAG = 2000   # deque maxlen — keeps the newest N points
+# Diagnostic flag thresholds
+SPIKE_RATIO        = 2.0   # max_eval > SPIKE_RATIO * final_eval
+WM_NOT_LEARNING    = 0.9   # obs_loss_late > WM_NOT_LEARNING * obs_loss_early
+POSTERIOR_COLLAPSE = 0.1   # kl_late < this
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def _load(arrays: dict, tag: str):
-    """Return (steps, values) arrays from pre-loaded dict."""
-    entry = arrays.get(tag)
-    if entry is None:
-        return np.array([]), np.array([])
-    return entry
-
-
-def _tail(vals: np.ndarray, n: int) -> np.ndarray:
-    return vals[-n:] if len(vals) >= n else vals
-
-
-def _head(vals: np.ndarray, n: int) -> np.ndarray:
-    return vals[:n] if len(vals) >= n else vals
-
-
-def _fmt(v, dec=1) -> str:
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return "N/A"
-    if isinstance(v, float) and (np.isinf(v) or abs(v) >= 1e6):
-        return f"{v:.2e}"
-    if isinstance(v, float) and abs(v) >= 1000:
-        return f"{v:.0f}"
-    return f"{v:.{dec}f}"
-
-
-def _parse_name(name: str):
-    import re
-    parts = name.split("_")
-    seed = None
-    # New format: _s0 / _s1 / _s2  (short seed tag from run_experiments.py)
-    m = re.search(r"_s(\d+)$", name)
-    if m:
-        seed = int(m.group(1))
-    else:
-        # Legacy format: _seed0 / _seed1
-        for p in reversed(parts):
-            if p.startswith("seed"):
-                try:
-                    seed = int(p[4:])
-                except ValueError:
-                    pass
-                break
-    if "adaptive" in name:
-        method = "adaptive"
-    elif "fixed_h5" in name:
-        method = "fixed_h5"
-    elif "fixed_h10" in name:
-        method = "fixed_h10"
-    elif "fixed_h15" in name:
-        method = "fixed_h15"
-    elif "fixed_h20" in name:
-        method = "fixed_h20"
-    else:
-        method = "?"
-    if "walker" in name.lower():
-        env = "Walker2d"
-    elif "hopper" in name.lower():
-        env = "Hopper"
-    elif "pendulum" in name.lower():
-        env = "Pendulum"
-    else:
-        env = "?"
-    return env, method, seed
-
-
-# ── per-run summary ────────────────────────────────────────────────────────────
-
-_CACHE_VERSION = 6   # bumped: added ema_obs_loss, rollback/event, wm/frozen tags
-
-
-def _stream_scalars(tb_dir: Path) -> Optional[dict]:
-    """
-    Stream scalar events directly from TFRecord event files.
-
-    Uses EventFileLoader (lower-level than EventAccumulator) + per-tag deques
-    so only _MAX_PER_TAG newest points per tag are ever held in memory,
-    and every non-scalar event is skipped immediately without allocation.
-
-    Returns {tag: (steps_array, vals_array)} or None if no event files found.
-    """
-    from collections import deque
-
-    event_files = sorted(tb_dir.glob("events.out.tfevents.*"))
-    if not event_files:
-        return None
-
-    steps_dq: dict = {t: deque(maxlen=_MAX_PER_TAG) for t in _WANTED_TAGS}
-    vals_dq:  dict = {t: deque(maxlen=_MAX_PER_TAG) for t in _WANTED_TAGS}
-
-    for ef in event_files:
-        try:
-            loader = EventFileLoader(str(ef))
-            for event in loader.Load():
-                if not event.HasField("summary"):
-                    continue
-                step = event.step
-                for val in event.summary.value:
-                    tag = val.tag
-                    if tag not in _WANTED_TAGS:
-                        continue
-                    if val.HasField("simple_value"):
-                        steps_dq[tag].append(step)
-                        vals_dq[tag].append(val.simple_value)
-                    # tensor scalars (newer TF summary format)
-                    elif val.HasField("tensor"):
-                        try:
-                            import struct as _struct
-                            raw = val.tensor.tensor_content
-                            if raw:
-                                v = _struct.unpack("<f", raw[:4])[0]
-                            else:
-                                v = float(val.tensor.float_val[0])
-                            steps_dq[tag].append(step)
-                            vals_dq[tag].append(v)
-                        except Exception:
-                            pass
-        except Exception:
-            continue   # truncated / corrupt file — skip
-
-    return {
-        tag: (
-            np.array(list(steps_dq[tag]), dtype=np.float64),
-            np.array(list(vals_dq[tag]),  dtype=np.float64),
-        )
-        for tag in _WANTED_TAGS
-    }
-
-
-def _cache_path(run_dir: Path) -> Path:
-    return run_dir / ".scan_cache.json"
-
-
-def _cache_valid(run_dir: Path, tb_dir: Path) -> bool:
-    cp = _cache_path(run_dir)
-    if not cp.exists():
-        return False
+def load_tb(tb_dir: Path, last_n: int, cache_file: Path, use_cache: bool = True):
+    """Load TensorBoard events; use JSON cache if available and fresh."""
     try:
-        with open(cp) as f:
-            meta = json.load(f)
-        if meta.get("version") != _CACHE_VERSION:
-            return False
-        cached_mtime = meta.get("tb_mtime", 0)
-        newest_event = max(
-            p.stat().st_mtime for p in tb_dir.glob("events.out.tfevents.*")
-        )
-        return newest_event <= cached_mtime
-    except Exception:
-        return False
-
-
-def _load_cache(run_dir: Path) -> Optional[dict]:
-    try:
-        with open(_cache_path(run_dir)) as f:
-            d = json.load(f)
-        return d.get("series")
-    except Exception:
-        return None
-
-
-def _arrays_to_json(arrays: dict) -> dict:
-    """Convert {tag: (steps_arr, vals_arr)} → JSON-serialisable dict."""
-    return {tag: {"steps": s.tolist(), "vals": v.tolist()}
-            for tag, (s, v) in arrays.items()}
-
-
-def _json_to_arrays(series: dict) -> dict:
-    """Convert JSON-loaded dict → {tag: (steps_arr, vals_arr)}."""
-    return {tag: (np.array(d["steps"], dtype=np.float64),
-                  np.array(d["vals"],  dtype=np.float64))
-            for tag, d in series.items()}
-
-
-def _save_cache(run_dir: Path, tb_dir: Path, arrays: dict) -> None:
-    newest_event = max(
-        p.stat().st_mtime for p in tb_dir.glob("events.out.tfevents.*")
-    )
-    payload = {"version": _CACHE_VERSION, "tb_mtime": newest_event,
-               "series": _arrays_to_json(arrays)}
-    try:
-        with open(_cache_path(run_dir), "w") as f:
-            json.dump(payload, f)
+        if use_cache and cache_file.exists():
+            cache_mtime = cache_file.stat().st_mtime
+            # Check if any event file is newer than cache
+            event_files = list(tb_dir.glob("events.out.tfevents.*"))
+            if event_files and max(f.stat().st_mtime for f in event_files) <= cache_mtime:
+                with open(cache_file) as f:
+                    return json.load(f)
     except Exception:
         pass
 
-
-def _load_cache_arrays(run_dir: Path) -> Optional[dict]:
+    data = {}
     try:
-        with open(_cache_path(run_dir)) as f:
-            d = json.load(f)
-        return _json_to_arrays(d["series"])
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        ea = EventAccumulator(str(tb_dir))
+        ea.Reload()
+        for tag in ea.Tags().get("scalars", []):
+            events = ea.Scalars(tag)
+            data[tag] = [(e.step, e.value) for e in events]
+    except Exception as exc:
+        metrics_file = tb_dir / "metrics.jsonl"
+        if not metrics_file.exists():
+            print(f"  Warning: could not load {tb_dir}: {exc}")
+            return {}
+        try:
+            with open(metrics_file) as f:
+                for line in f:
+                    row = json.loads(line)
+                    step = row.get("step")
+                    if step is None:
+                        continue
+                    for tag, value in row.items():
+                        if tag == "step":
+                            continue
+                        if isinstance(value, (int, float)):
+                            data.setdefault(tag, []).append((step, value))
+        except Exception as json_exc:
+            print(f"  Warning: could not load {tb_dir}: {exc}; JSONL fallback failed: {json_exc}")
+            return {}
+
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(data, f)
     except Exception:
-        return None
+        pass
+    return data
 
 
-def summarize_run(run_dir: Path, last_n: int) -> Optional[dict]:
+def tail(series, n):
+    return [v for _, v in series[-n:]] if series else []
+
+
+def head_frac(series, frac=0.33):
+    n = max(1, int(len(series) * frac))
+    return [v for _, v in series[:n]]
+
+
+def tail_frac(series, frac=0.33):
+    n = max(1, int(len(series) * frac))
+    return [v for _, v in series[-n:]]
+
+
+def safe_mean(vals):
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def safe_max(vals):
+    return max(vals) if vals else float("nan")
+
+
+def fmt(v, decimals=2):
+    if v != v:  # nan
+        return "  --  "
+    return f"{v:.{decimals}f}"
+
+
+def analyse_run(run_dir: Path, last_n: int, use_cache: bool = True):
     tb_dir = run_dir / "tb"
     if not tb_dir.exists():
         return None
 
-    # ── cache hit (instant) ────────────────────────────────────────────────────
-    if _cache_valid(run_dir, tb_dir):
-        arrays = _load_cache_arrays(run_dir)
-        if arrays is not None:
-            return _compute_stats(run_dir, arrays, last_n)
-
-    # ── cold path: stream directly from TFRecord event files ──────────────────
-    arrays = _stream_scalars(tb_dir)
-    if arrays is None:
+    cache_file = tb_dir / ".scan_cache.json"
+    data = load_tb(tb_dir, last_n, cache_file, use_cache=use_cache)
+    if not data:
         return None
-    _save_cache(run_dir, tb_dir, arrays)
-    return _compute_stats(run_dir, arrays, last_n)
 
+    # Helper: get tag from possible aliases
+    def get(tag, *aliases):
+        for t in [tag] + list(aliases):
+            if t in data:
+                return data[t]
+            # try with train/ prefix
+            train_t = f"train/{t}"
+            if train_t in data:
+                return data[train_t]
+        return []
 
-def _compute_stats(run_dir: Path, arrays: dict, last_n: int) -> dict:
-    """Compute all summary statistics from pre-loaded numpy arrays."""
+    eval_series   = get("eval/return_mean")
+    kl_series     = get("loss/rep", "loss/dyn")
+    obs_series    = get("loss/obs")
+    prior_series  = get("wm/prior_pred_loss", "loss/obs_prior")
+    ema_series    = get("wm/ema_obs_loss")
+    horizon_series = get("imagine/horizon")
+    entropy_series = get("action_entropy", "policy/std_mean")
 
-    def get(tag):
-        return arrays.get(tag, (np.array([]), np.array([])))
+    total_steps = max((s for s, _ in eval_series), default=0) if eval_series else 0
 
-    def tl(tag):
-        _, v = get(tag)
-        return _tail(v, last_n)
+    eval_vals   = tail(eval_series, last_n)
+    final_eval  = safe_mean(tail(eval_series, 5))
+    max_eval    = safe_max([v for _, v in eval_series] if eval_series else [])
+    early_eval  = safe_mean(head_frac(eval_series))
+    late_eval   = safe_mean(tail_frac(eval_series))
 
-    def last_s(tag):
-        s, _ = get(tag)
-        return int(s[-1]) if len(s) else 0
+    obs_early   = safe_mean(head_frac(obs_series))
+    obs_late    = safe_mean(tail_frac(obs_series))
+    kl_late     = safe_mean(tail_frac(kl_series))
+    prior_late  = safe_mean(tail_frac(prior_series))
+    ema_late    = safe_mean(tail(ema_series, 10))
+    h_mean      = safe_mean([v for _, v in horizon_series]) if horizon_series else float("nan")
+    h_std       = (
+        (sum((v - h_mean)**2 for _, v in horizon_series) / len(horizon_series)) ** 0.5
+        if len(horizon_series) > 1 else 0.0
+    )
+    entropy_late = safe_mean(tail(entropy_series, last_n))
 
-    # ── eval ──────────────────────────────────────────────────────────────────
-    eval_steps, eval_ret = get("eval/return_mean")
-
-    final_eval  = float(np.mean(_tail(eval_ret, 5)))  if len(eval_ret) >= 1 else None
-    max_eval    = float(np.max(eval_ret))              if len(eval_ret) >= 1 else None
-    early_eval  = float(np.mean(_head(eval_ret, 5)))  if len(eval_ret) >= 1 else None
-
-    max_step_at = None
-    if len(eval_ret) >= 1:
-        max_idx = int(np.argmax(eval_ret))
-        max_step_at = int(eval_steps[max_idx]) if len(eval_steps) > max_idx else None
-
-    spike = False
-    if max_eval is not None and final_eval is not None:
-        drop     = max_eval - final_eval
-        # Flag spike-then-drop if the peak was at least 30 above final eval AND
-        # represents a meaningful fraction of the peak (not just noise).
-        # Removed the max_step_at < 0.5*total guard: spikes in the second half of
-        # training are equally real (e.g. Walker2d/adaptive/s1: peak=317@317k, final=-22).
-        spike    = (drop > 30) and (max_eval is not None) and (max_eval > 0) and (max_step_at is not None)
-
-    plateau = float(np.std(_tail(eval_ret, 10))) if len(eval_ret) >= 10 else None
-
-    # ── train return ──────────────────────────────────────────────────────────
-    _, train_ret20 = get("train/return_mean_20")
-    final_train    = float(np.mean(_tail(train_ret20, 20))) if len(train_ret20) >= 1 else None
-    peak_train     = float(np.max(train_ret20))             if len(train_ret20) >= 1 else None
-
-    # ── rollbacks ─────────────────────────────────────────────────────────────
-    _, rb_eval  = get("eval/rollback")
-    _, rb_train = get("train/rollback")
-    n_rollbacks = int(rb_eval.sum() + rb_train.sum()) if (len(rb_eval) + len(rb_train)) > 0 else 0
-    # New per-rollback markers (more reliable than the old aggregate counters)
-    rb_steps, rb_events = get("rollback/event")
-    n_rollback_events   = int(rb_events.sum()) if len(rb_events) > 0 else n_rollbacks
-    rb_from_steps, _    = get("rollback/from_step")
-    _, wm_frozen_v      = get("wm/frozen")
-    wm_frozen_count     = int(wm_frozen_v.sum()) if len(wm_frozen_v) > 0 else 0
-
-    # ── imagination / horizon ─────────────────────────────────────────────────
-    hor_vals  = tl("imagine/horizon_used")
-    unc_vals  = tl("imagine/uncertainty_mean")
-    cont_vals = tl("imagine/cont_prob_mean")
-    mean_hor  = float(np.mean(hor_vals))  if len(hor_vals) else None
-    mean_unc  = float(np.mean(unc_vals))  if len(unc_vals) else None
-    mean_cont = float(np.mean(cont_vals)) if len(cont_vals) else None
-    h_min_pct = float(np.mean(hor_vals == hor_vals.min())) * 100 if len(hor_vals) else None
-    # Per-horizon percentages (for adaptive runs with H=10/H=15/H=20)
-    h_pct = {}
-    if len(hor_vals) > 0:
-        for h in [5, 10, 15, 20]:
-            pct = float(np.mean(hor_vals == h)) * 100
-            if pct > 0:
-                h_pct[h] = pct
-
-    # ── policy ────────────────────────────────────────────────────────────────
-    std_vals  = tl("policy/std_mean")
-    ent_vals  = tl("policy/entropy_gaussian")
-    mean_std  = float(np.mean(std_vals)) if len(std_vals) else None
-    mean_ent  = float(np.mean(ent_vals)) if len(ent_vals) else None
-
-    # ── gradients & losses ────────────────────────────────────────────────────
-    act_grads  = tl("grad/actor_norm")
-    wm_vals    = tl("loss/world_model")
-    mean_act_g = float(np.mean(act_grads)) if len(act_grads) else None
-    mean_wm    = float(np.mean(wm_vals))   if len(wm_vals)   else None
-
-    _, rscale_all = get("value/return_scale")
-    mean_rscale   = float(np.mean(_tail(rscale_all, last_n))) if len(rscale_all) else None
-    max_rscale    = float(np.max(rscale_all))                 if len(rscale_all) else None
-    # rscale capped fraction: how often rscale > 95 (out of all logged steps)
-    rscale_capped_pct = (float(np.mean(rscale_all > 95)) * 100) if len(rscale_all) > 10 else None
-
-    # ── EMA obs_loss (adaptive horizon signal) ────────────────────────────────
-    ema_steps, ema_obs_vals = get("wm/ema_obs_loss")
-    ema_obs_early = float(np.mean(_head(ema_obs_vals, max(1, len(ema_obs_vals)//3)))) if len(ema_obs_vals) >= 3 else None
-    ema_obs_late  = float(np.mean(_tail(ema_obs_vals, max(1, len(ema_obs_vals)//3)))) if len(ema_obs_vals) >= 3 else None
-
-    max_step = max(last_s("eval/return_mean"),
-                   last_s("imagine/horizon_used"),
-                   last_s("loss/world_model"))
-
-    env, method, seed = _parse_name(run_dir.name)
-
-    # ── problem flags ─────────────────────────────────────────────────────────
-    problems = []
-    # HORIZON_STUCK: only fire when WM is confident (low unc) but still using minimum
-    # horizon. This is a genuine bug (WM good but not using long horizon).
-    # H=10:100% with unc>0.90 is CORRECT (high WM uncertainty → short horizon by design).
-    # H=15:100% or H=20:100% are always correct (mid/max horizon = working as intended).
-    if (h_min_pct is not None and h_min_pct > 90 and method == "adaptive"
-            and mean_hor is not None and mean_hor <= 10
-            and mean_unc is not None and mean_unc < 0.5):
-        problems.append(f"HORIZON_STUCK@{h_min_pct:.0f}%_min")
-    if mean_act_g is not None and mean_act_g < 0.01:
-        problems.append(f"ACTOR_GRAD_TINY({mean_act_g:.4f})")
-    if mean_std is not None and mean_std < 0.15:
-        problems.append(f"STD_COLLAPSED({mean_std:.3f})")
-    if mean_std is not None and mean_std > 1.30:
-        problems.append(f"STD_HIGH({mean_std:.3f})")
-    if plateau is not None and plateau < 5.0 and final_eval is not None and final_eval < 200:
-        problems.append(f"PLATEAU(σ={plateau:.1f})")
-    if mean_unc is not None and mean_unc > 2.0:
-        problems.append(f"UNC_SCALE({mean_unc:.2f})")
-    if spike:
-        problems.append(f"SPIKE_THEN_DROP(peak={max_eval:.0f}@{max_step_at//1000}k→now={final_eval:.0f})")
-    if max_rscale is not None and max_rscale > 200.0:
-        problems.append(f"VALUE_DIVERGE(rscale_max={max_rscale:.0f})")
-    if rscale_capped_pct is not None and rscale_capped_pct > 50.0:
-        problems.append(f"RSCALE_CAPPED_PERSISTENT({rscale_capped_pct:.0f}%>95)")
-    _cont_thresh = CONT_THRESHOLDS.get(method, 0.70)
-    if mean_cont is not None and mean_cont < _cont_thresh:
-        problems.append(f"CONT_LOW({mean_cont:.2f}<{_cont_thresh})")
-    if n_rollback_events > 0:
-        problems.append(f"ROLLBACKS={n_rollback_events}")
-    # EMA obs_loss stuck: for adaptive runs, if ema_obs_late is above the high threshold
-    # the whole run, horizon can never progress past H_min.
-    if ema_obs_late is not None and method == "adaptive" and ema_obs_late > 0.25:
-        problems.append(f"EMA_OBS_HIGH(late={ema_obs_late:.3f})")  # Hopper: thresh=0.28
+    # Diagnostic flags
+    flags = []
+    if final_eval == final_eval and max_eval == max_eval:
+        if max_eval > SPIKE_RATIO * max(final_eval, 1e-6):
+            flags.append("SPIKE")
+    if obs_early == obs_early and obs_late == obs_late and obs_early > 0:
+        if obs_late > WM_NOT_LEARNING * obs_early:
+            flags.append("WM_STALL")
+    if kl_late == kl_late and kl_late < POSTERIOR_COLLAPSE:
+        flags.append("POST_COLL")
+    if h_std < 0.5 and len(horizon_series) > 10:
+        flags.append("H_STUCK")
 
     return {
-        "run_dir":      run_dir.name,
-        "env":          env,
-        "method":       method,
-        "seed":         seed,
-        "max_step":     max_step,
-        "final_eval":   final_eval,
-        "max_eval":     max_eval,
-        "early_eval":   early_eval,
-        "spike":        spike,
-        "final_train":  final_train,
-        "peak_train":   peak_train,
-        "plateau_std":  plateau,
-        "mean_horizon": mean_hor,
-        "h_min_pct":    h_min_pct,
-        "mean_unc":     mean_unc,
-        "mean_cont":    mean_cont,
-        "mean_std":     mean_std,
-        "mean_ent":     mean_ent,
-        "actor_grad":   mean_act_g,
-        "return_scale": mean_rscale,
-        "max_rscale":   max_rscale,
-        "wm_loss":            mean_wm,
-        "n_rollbacks":        n_rollback_events,
-        "wm_frozen_count":    wm_frozen_count,
-        "rscale_capped_pct":  rscale_capped_pct,
-        "ema_obs_early":      ema_obs_early,
-        "ema_obs_late":       ema_obs_late,
-        "h_pct":              h_pct,
-        "problems":           problems,
-        "_eval_steps":        eval_steps,
-        "_eval_ret":          eval_ret,
+        "run": run_dir.name,
+        "steps": total_steps,
+        "eval_final": final_eval,
+        "eval_max": max_eval,
+        "eval_std": (
+            (sum((v - final_eval)**2 for v in eval_vals) / max(len(eval_vals) - 1, 1))**0.5
+            if len(eval_vals) > 1 else 0.0
+        ),
+        "obs_loss": obs_late,
+        "prior_loss": prior_late,
+        "kl": kl_late,
+        "ema_obs": ema_late,
+        "h_mean": h_mean,
+        "entropy": entropy_late,
+        "flags": ",".join(flags) if flags else "OK",
     }
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
-
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--runs_dir", default="runs")
-    p.add_argument("--filter",   default=None)
-    p.add_argument("--env",      default=None)
-    p.add_argument("--method",   default=None)
-    p.add_argument("--sort",     default="final_eval",
-                   choices=["final_eval", "max_eval", "max_step", "mean_horizon",
-                            "actor_grad", "mean_unc", "run_dir", "final_train"])
-    p.add_argument("--last_n",   type=int, default=50)
-    p.add_argument("--csv",      default=None)
-    p.add_argument("--problems_only", action="store_true")
-    p.add_argument("--curve",    action="store_true",
-                   help="Print ASCII learning curve (eval return over time) for each run")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs_dir", default=str(RUNS_DIR))
+    ap.add_argument("--filter", default="", help="substring filter on run name")
+    ap.add_argument("--sort", default="eval/return_mean", help="column to sort by")
+    ap.add_argument("--last_n", type=int, default=100, help="last N points per tag")
+    ap.add_argument("--csv", default="", help="write CSV to this path")
+    ap.add_argument("--no_cache", action="store_true")
+    args = ap.parse_args()
 
-    runs_dir = ROOT / args.runs_dir
+    runs_dir = Path(args.runs_dir)
     if not runs_dir.exists():
-        print(f"[ERROR] runs_dir not found: {runs_dir}")
-        sys.exit(1)
-
-    run_dirs = sorted(d for d in runs_dir.iterdir() if d.is_dir())
-    if args.filter:
-        run_dirs = [d for d in run_dirs if args.filter.lower() in d.name.lower()]
-    if args.env:
-        run_dirs = [d for d in run_dirs if args.env.lower() in d.name.lower()]
-    if args.method:
-        run_dirs = [d for d in run_dirs if args.method.lower() in d.name.lower()]
-
-    n_workers = min(len(run_dirs), os.cpu_count() or 8)
-    print(f"\nScanning {len(run_dirs)} run(s) in {runs_dir} …  "
-          f"(last_n={args.last_n}, workers={n_workers})")
-    results = []
-    skipped = []
-    pbar = _tqdm(total=len(run_dirs), desc="Loading TB logs", unit="run",
-                 dynamic_ncols=True, leave=True)
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(summarize_run, rd, args.last_n): rd for rd in run_dirs}
-        for fut in as_completed(futures):
-            rd = futures[fut]
-            try:
-                r = fut.result(timeout=120)
-            except Exception as exc:
-                r = None
-                skipped.append(f"{rd.name} (error: {exc})")
-                pbar.set_postfix_str(f"{rd.name[:25]} ERROR", refresh=False)
-                pbar.update(1)
-                continue
-            if r is None:
-                skipped.append(rd.name)
-            else:
-                results.append(r)
-            cached = "(cached)" if (rd / ".scan_cache.json").exists() else "(parsed)"
-            pbar.set_postfix_str(f"{rd.name[:30]} {cached}", refresh=False)
-            pbar.update(1)
-    pbar.close()
-    for name in sorted(skipped):
-        print(f"  [SKIP] {name}  (no TB events)")
-    print(f"Loaded {len(results)} run(s).\n")
-
-    if not results:
-        print("Nothing to show.")
+        print(f"No runs directory at {runs_dir}")
         return
 
-    def sort_key(r):
-        v = r[args.sort]
-        is_none = (v is None)
-        neg = -v if isinstance(v, (int, float)) and v is not None else (v or "")
-        return (is_none, neg)
+    run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir()])
+    if args.filter:
+        run_dirs = [d for d in run_dirs if args.filter.lower() in d.name.lower()]
 
-    results.sort(key=sort_key)
+    results = []
+    for d in run_dirs:
+        r = analyse_run(d, args.last_n, use_cache=not args.no_cache)
+        if r:
+            results.append(r)
 
-    if args.problems_only:
-        results = [r for r in results if r["problems"]]
+    if not results:
+        print("No runs found.")
+        return
 
-    # ── main table ─────────────────────────────────────────────────────────────
-    # RUN column: compact "env/method/sN" label — no path truncation artefacts.
-    # Full run_dir is printed only in the detail sections below.
-    def _run_label(r) -> str:
-        env  = (r["env"]    or "?")[:7]
-        mth  = (r["method"] or "?")[:10]
-        seed = r["seed"] if r["seed"] is not None else "?"
-        return f"{env}/{mth}/s{seed}"
+    # Sort
+    sort_map = {
+        "eval/return_mean": "eval_final",
+        "eval_final": "eval_final",
+        "steps": "steps",
+        "eval_max": "eval_max",
+    }
+    sort_key = sort_map.get(args.sort, "eval_final")
+    results.sort(key=lambda r: -(r[sort_key] if r[sort_key] == r[sort_key] else -1e9))
 
-    W = 24
-    print(
-        f"{'RUN':<{W}} {'STEPS':>8} {'F_EVAL':>7} {'MAX_E':>7} {'TRAIN_R':>8} "
-        f"{'CONT_P':>7} {'H_MEAN':>7} {'UNC':>7} "
-        f"{'EMA_OBS':>8} {'STD':>5} {'ACT_G':>6} {'RSCALE%CAP':>10}  PROBLEMS"
-    )
-    print("─" * 190)
-
+    # Print table
+    header = f"{'RUN':<55} {'STEPS':>6} {'EVAL':>7} {'MAX_E':>7} {'STD':>5} {'OBS_L':>6} {'PRIOR':>6} {'KL':>5} {'EMA':>6} {'H_AVG':>6} {'ENT':>6}  FLAGS"
+    print(header)
+    print("-" * len(header))
     for r in results:
-        label = _run_label(r)
-        probs_str = "  ".join(r["problems"]) if r["problems"] else "OK"
-        spike_marker = "▲▼" if r["spike"] else "  "
-        # Show ema_obs_late if available, else "-"
-        ema_str = _fmt(r.get("ema_obs_late"), 3) if r.get("ema_obs_late") is not None else "-"
-        cap_pct = r.get("rscale_capped_pct")
-        cap_str = f"{cap_pct:.0f}%" if cap_pct is not None else "-"
+        steps_k = f"{r['steps']//1000}k"
         print(
-            f"{label:<{W}} "
-            f"{r['max_step']:>8,} "
-            f"{_fmt(r['final_eval'], 1):>7} "
-            f"{spike_marker}{_fmt(r['max_eval'], 1):>5} "
-            f"{_fmt(r['final_train'], 1):>8} "
-            f"{_fmt(r['mean_cont'],   2):>7} "
-            f"{_fmt(r['mean_horizon'],1):>7} "
-            f"{_fmt(r['mean_unc'],    2):>7} "
-            f"{ema_str:>8} "
-            f"{_fmt(r['mean_std'],    2):>5} "
-            f"{_fmt(r['actor_grad'],  3):>6} "
-            f"{cap_str:>10}  "
-            f"{probs_str}"
+            f"{r['run']:<55} {steps_k:>6} {fmt(r['eval_final']):>7} {fmt(r['eval_max']):>7}"
+            f" {fmt(r['eval_std']):>5} {fmt(r['obs_loss']):>6} {fmt(r['prior_loss']):>6}"
+            f" {fmt(r['kl']):>5} {fmt(r['ema_obs']):>6} {fmt(r['h_mean']):>6}"
+            f" {fmt(r['entropy'], 3):>6}  {r['flags']}"
         )
 
-    # ── per-method summary ─────────────────────────────────────────────────────
-    print("\n" + "─" * 60)
-    print("  Per-method: final_eval mean±std  |  peak_train mean  |  cont_prob mean")
-    print("─" * 60)
-    from collections import defaultdict
-    by_method: dict[str, list] = defaultdict(list)
-    for r in results:
-        key = f"{r['env']}/{r['method']}"
-        by_method[key].append(r)
+    print(f"\n{len(results)} runs shown.")
 
-    for key in sorted(by_method):
-        runs = by_method[key]
-        evals  = [r["final_eval"]  for r in runs if r["final_eval"]  is not None]
-        trains = [r["peak_train"]  for r in runs if r["peak_train"]  is not None]
-        conts  = [r["mean_cont"]   for r in runs if r["mean_cont"]   is not None]
-        spikes = sum(1 for r in runs if r["spike"])
-        e_mu, e_sd = (np.mean(evals), np.std(evals)) if evals else (None, None)
-        t_mu       = np.mean(trains) if trains else None
-        c_mu       = np.mean(conts)  if conts  else None
-        print(
-            f"  {key:<32}  n={len(runs)}"
-            f"  eval={_fmt(e_mu,1)} ± {_fmt(e_sd,1)}"
-            f"  train_peak={_fmt(t_mu,1)}"
-            f"  cont={_fmt(c_mu,2)}"
-            + (f"  ⚡ {spikes} spike-then-drop" if spikes else "")
-        )
-
-    # ── spike-then-drop analysis ───────────────────────────────────────────────
-    spikes = [r for r in results if r["spike"]]
-    if spikes:
-        print("\n" + "─" * 60)
-        print(f"  ⚡ Spike-then-drop runs ({len(spikes)}):")
-        print("─" * 60)
-        for r in spikes:
-            drop = (r["max_eval"] or 0) - (r["final_eval"] or 0)
-            print(f"  {r['run_dir'][:65]}")
-            print(f"    peak={r['max_eval']:.0f} @ step {r['max_step']:,}  →  "
-                  f"now={r['final_eval']:.1f}  (drop={drop:.0f})")
-
-    # ── cont_prob diagnosis ────────────────────────────────────────────────────
-    bad_cont = [r for r in results
-                if r["mean_cont"] is not None
-                and r["mean_cont"] < CONT_THRESHOLDS.get(r["method"], 0.70)]
-    if bad_cont:
-        print("\n" + "─" * 60)
-        print("  ⚠  Low cont_prob (below horizon-adjusted threshold):")
-        print("─" * 60)
-        for r in bad_cont:
-            thresh = CONT_THRESHOLDS.get(r["method"], 0.70)
-            print(f"  {r['run_dir'][:65]}  cont={r['mean_cont']:.2f}  (thresh={thresh})")
-    elif any(r["mean_cont"] is not None for r in results):
-        good = [r["mean_cont"] for r in results if r["mean_cont"] is not None]
-        print(f"\n  ✓ cont_prob looks healthy: mean={np.mean(good):.2f}  "
-              f"min={np.min(good):.2f}  (expected >0.90 for H=5, >0.60 for H=20)")
-
-    # ── problem report ─────────────────────────────────────────────────────────
-    all_problems = [r for r in results if r["problems"]]
-    if all_problems:
-        print("\n" + "─" * 60)
-        print(f"  ⚠  {len(all_problems)} run(s) with detected problems:")
-        print("─" * 60)
-        for r in all_problems:
-            print(f"  {r['run_dir'][:70]}")
-            for prob in r["problems"]:
-                print(f"    → {prob}")
-
-    # ── ASCII learning curves ──────────────────────────────────────────────────
-    if args.curve:
-        print("\n" + "─" * 60)
-        print("  Learning curves (eval/return_mean)")
-        print("─" * 60)
-        for r in results:
-            # Reuse series already loaded during summarize_run — no second Reload needed.
-            steps = r["_eval_steps"]
-            vals  = r["_eval_ret"]
-            if len(vals) == 0:
-                continue
-            n = min(40, len(vals))
-            idx = np.linspace(0, len(vals)-1, n, dtype=int)
-            v_sub = vals[idx]
-            s_sub = steps[idx]
-            vmin, vmax = v_sub.min(), v_sub.max()
-            scale = max(vmax - vmin, 1.0)
-            bar_w = 40
-            print(f"\n  {r['run_dir'][:60]}  [{vmin:.0f} … {vmax:.0f}]")
-            for s, v in zip(s_sub, v_sub):
-                filled = int((v - vmin) / scale * bar_w)
-                bar = "█" * filled + "░" * (bar_w - filled)
-                step_k = int(s) // 1000
-                print(f"    {step_k:>5}k  {bar}  {v:6.1f}")
-
-    # ── CSV export ─────────────────────────────────────────────────────────────
     if args.csv:
-        csv_path = Path(args.csv)
-        _skip = {"problems", "_eval_steps", "_eval_ret"}
-        fieldnames = [k for k in results[0].keys() if k not in _skip]
-        fieldnames.append("problems_str")
-        with open(csv_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
+        import csv
+        with open(args.csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(results[0].keys()))
             w.writeheader()
-            for r in results:
-                row = {k: v for k, v in r.items() if k not in _skip}
-                row["problems_str"] = "; ".join(r["problems"])
-                w.writerow(row)
-        print(f"\nCSV written to {csv_path}")
+            w.writerows(results)
+        print(f"Wrote {args.csv}")
 
 
 if __name__ == "__main__":

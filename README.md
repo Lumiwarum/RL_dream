@@ -1,197 +1,352 @@
-# ThesisWM — DreamerV3-style World Model RL with Adaptive Imagination Horizon
+# DreamerV3 — Adaptive Imagination Horizon (Thesis Implementation)
 
-Master thesis project. Core idea: replace DreamerV3's fixed planning horizon with an
-**ensemble-based adaptive horizon** — when the world model ensemble disagrees (high
-uncertainty), use a short rollout (H=5, safer); when it agrees (low uncertainty), use
-a long rollout (H=20, better credit assignment).
+A DreamerV3-style world-model agent extended with two thesis contributions:
+
+1. **Adaptive imagination horizon** — the planning horizon H is selected at runtime based on an EMA of the world model's prior-prediction quality. When the WM is unreliable (high prior loss), a shorter H is used to limit compounding errors.
+2. **World-model ensemble** — N independent world models provide diverse reward estimates during imagination. Optionally averages rewards across members for a pessimistic/robust signal.
+
+Built on top of [r2dreamer](https://github.com/NM512/r2dreamer) (NM512). The representation loss (InfoNCE / Barlow-Twins) has been removed; the model uses the standard DreamerV3 decoder reconstruction objective instead.
 
 ---
 
-## ⚡ RIGHT NOW — Run the smoke test first
+## Architecture
 
-**Do this before anything else.** The smoke test runs 4 experiments (Hopper ×
-{fixed\_h20, adaptive} × 2 seeds × 100k steps) to verify all recent fixes are
-working before committing to 24 full runs.
+```
+Observations ──► Encoder (MLP, symlog) ──► RSSM
+                                               │
+                              ┌────────────────┴──────────────────────┐
+                              │  Posterior z_t (observe step)         │
+                              │  Prior z_t     (imagine step)         │
+                              └────────────────┬──────────────────────┘
+                                               │
+                              ┌────────────────▼──────────────────────┐
+                              │  Decoder  (obs reconstruction)        │
+                              │  Reward head (symexp two-hot bins)    │
+                              │  Continue head (Bernoulli)            │
+                              └───────────────────────────────────────┘
+                                               │
+                         Actor ◄───── features (h_t ⊕ z_t) ──────► Critic
+```
+
+Key details:
+- **RSSM**: block-GRU deterministic core, categorical stochastic latent (32×32 → 1024-dim)
+- **Encoder/Decoder**: 3-layer MLP with SiLU + RMSNorm; symlog input preprocessing
+- **Actor**: bounded Normal distribution with learnable std
+- **Critic**: symexp two-hot binned distribution (255 bins), slow EMA target
+- **Optimizer**: LaProp with AGC gradient clipping and linear warmup
+
+---
+
+## Setup
 
 ```bash
-# 1. Kill any currently running experiments (they used the OLD config)
-#    Find the PIDs:
-ps aux | grep train.py
-#    Then: kill <pid> <pid> ...
+pip install -r requirements.txt
+```
 
-# 2. Dry-run to see what will be launched
+Requires Python 3.10+, CUDA 12.8 (for `torch==2.8.0`), and MuJoCo 3.x.
+
+To verify the environment:
+
+```bash
+cd dreamer_impl
+python scripts/env_scan.py
+```
+
+---
+
+## Quick Start
+
+### Single training run
+
+```bash
+cd dreamer_impl
+
+# Fixed horizon H=15, single WM, Hopper
+python train.py exp_name=hopper_h15 env.id=Hopper-v4
+
+# Fixed horizon H=15, Pendulum (faster smoke test)
+python train.py exp_name=pendulum_h15 env.id=InvertedPendulum-v5 trainer.steps=200000
+
+# Adaptive horizon, single WM
+python train.py exp_name=hopper_adaptive env.id=Hopper-v4 \
+    adaptive.enabled=true
+
+# Ensemble (N=2) with averaged rewards
+python train.py exp_name=hopper_ens env.id=Hopper-v4 \
+    model.ensemble_size=2 model.ensemble_avg_rewards=true
+```
+
+All results land under `dreamer_impl/runs/<exp_name>/`.
+
+### Overriding config values
+
+Any config key can be overridden on the command line with `key=value` or `section.key=value`:
+
+```bash
+python train.py exp_name=test env.id=Walker2d-v4 \
+    trainer.steps=200000 \
+    env.num_envs=4 \
+    adaptive.enabled=true \
+    adaptive.horizons=[10,15,20] \
+    adaptive.thresh_high=1.8 adaptive.thresh_mid=1.3
+```
+
+---
+
+## Running Experiment Groups
+
+`scripts/run_experiments.py` manages predefined experiment groups and a CSV manifest.
+
+```bash
+# List experiments in a group
+python scripts/run_experiments.py --group smoke --list
+
+# Dry-run (print commands without executing)
 python scripts/run_experiments.py --group smoke --dry_run
 
-# 3. Run (uses 4 parallel jobs, 4 GPUs)
-python scripts/run_experiments.py --group smoke --parallel 4 --gpus 4
+# Run all experiments in the smoke group sequentially
+python scripts/run_experiments.py --group smoke
 
-# 4. While running — check diagnostics every ~10 min
-python scripts/analyze_runs.py --runs_dir runs/ --filter smoke
+# Run 4 experiments in parallel across 2 GPUs
+python scripts/run_experiments.py --group main --parallel 4 --gpus 2
 
-# 5. After ~100k steps — generate figures
-python scripts/make_thesis_figures.py --runs_dir runs/ --filter smoke
+# Skip experiments already marked done in the manifest
+python scripts/run_experiments.py --group main --skip_done
 ```
 
-### What to look for in the smoke report
+Available groups:
 
-The report (`report_<timestamp>.txt`) will show a **WM Health** and **AC Health**
-section for each run. Here is what healthy vs broken looks like:
+| Group | Environments | Methods | Seeds |
+|-------|-------------|---------|-------|
+| `smoke` | InvertedPendulum | fixed_h15, adaptive_n1 | 0 |
+| `main` | Hopper | fixed_h10/h15/h20, adaptive_n1 | 0,1,2 |
+| `control` | Hopper | fixed_h20, fixed_h20_ens, adaptive, adaptive_ens | 0,1 |
+| `control_full` | Hopper, InvertedPendulum | same as control | 0,1,2 |
 
-| Metric | Healthy ✓ | Broken ✗ | What it means |
-|--------|-----------|----------|---------------|
-| `obs_loss` | early ~1.2, **late < 0.3** | stays flat/rises | WM learning to predict observations |
-| `kl_loss` | **> 1.0** at late training | ≈ 0.0 throughout | KL>0 = posterior encodes info |
-| `policy_std` | **decreasing** from 1.0 | stuck at 1.0 | Actor learning (entropy fix working) |
-| `return_scale` | **< 80**, stable | at 100 cap | Actor gradients alive |
-| `actor_grad` | **0.01–0.15** | < 0.005 | Policy updating |
-| `actor_loss` | **negative** (< 0) | positive (> 0) | Positive = negative advantage = bad bootstrap |
-| `horizon_trend` | **early H=10, late H=20** (adaptive) | H=20 100% always | Adaptive mechanism working |
-
-**A healthy smoke run should show by step 50k:**
-- `obs_loss` dropped from ~1.2 → below 0.4
-- `policy_std` dropped from 1.0 → below 0.85
-- `actor_loss` negative for both methods
-- No `SPIKE_THEN_DROP` flag
-- Adaptive runs: `horizon_trend Δ > +3` (horizon shifting from H=10 toward H=20 as WM converges)
+The manifest is written to `experiments/manifest.csv` and tracks `status`, `start_time`, `end_time` per experiment.
 
 ---
 
-## Full experiments (run after smoke test passes)
+## TensorBoard Monitoring
 
 ```bash
-# 24 runs: Hopper + Walker2d × {fixed_h5, fixed_h15, fixed_h20, adaptive} × 3 seeds
-# Interleaved order: seed 0 of all methods starts first (fixed + adaptive together)
-python scripts/run_experiments.py --group main --parallel 8 --gpus 8
-
-# Extend existing 300k runs to 500k (total_steps bumped to 500k in SHARED_TRAINING_OVERRIDES)
-# --skip_done skips truly finished runs; completed-at-300k runs will resume automatically
-python scripts/run_experiments.py --group main --parallel 8 --gpus 8
-
-# Resume after a crash (skips runs that already have a complete checkpoint)
-python scripts/run_experiments.py --group main --parallel 8 --gpus 8 --skip_done
-
-# Dry-run first to verify commands
-python scripts/run_experiments.py --group main --dry_run
+cd dreamer_impl
+tensorboard --logdir runs
 ```
 
-> **GPU memory**: ~2–4 GB VRAM per job (ensemble=2, rollout_batch=512, hidden=256).
-> 8 jobs × 8 GPUs = 1 job per GPU.
+Key metrics to watch:
+
+| Tag | Meaning |
+|-----|---------|
+| `eval/return_mean` | Mean eval return across eval envs |
+| `eval/best_return` | Best eval return seen so far |
+| `train/loss/policy` | Actor loss |
+| `train/loss/value` | Value loss |
+| `train/loss/dyn` | KL divergence (dynamics) |
+| `train/loss/rep` | KL divergence (representation) |
+| `train/loss/obs` | Observation reconstruction loss |
+| `train/wm/prior_pred_loss` | Prior prediction loss (horizon signal) |
+| `train/wm/ema_obs_loss` | EMA of prior_pred_loss |
+| `train/imagine/horizon` | Selected imagination horizon H |
+| `train/ret` | Mean imagined lambda-return |
+| `train/adv` | Mean advantage |
+| `train/action_entropy` | Policy entropy |
 
 ---
 
-## Monitoring and diagnostics
+## Analyzing Run Logs
 
 ```bash
-# ── Live status table (run repeatedly while training) ─────────────────────────
-python scripts/scan_logs.py --runs_dir runs/
+cd dreamer_impl
 
-# ── Full diagnostic report with WM health + AC health + root-cause diagnosis ──
-python scripts/analyze_runs.py --runs_dir runs/
+# Quick table scan (all runs)
+python scripts/scan_logs.py
 
-# ── Filter to one env or group ─────────────────────────────────────────────────
-python scripts/analyze_runs.py --runs_dir runs/ --filter hopper
-python scripts/analyze_runs.py --runs_dir runs/ --filter adaptive
+# Filter to specific runs
+python scripts/scan_logs.py --runs_dir runs --filter hopper
 
-# ── TensorBoard ────────────────────────────────────────────────────────────────
-tensorboard --logdir runs/ --port 8032
+# Verbose output with per-run detail
+python scripts/scan_logs.py --verbose
 
-# ── Thesis figures + LaTeX tables ─────────────────────────────────────────────
-python scripts/make_thesis_figures.py --runs_dir runs/
-# Output: thesis/figures/*.pdf  and  thesis/tables/*.tex
+# Skip TensorBoard cache
+python scripts/scan_logs.py --no_cache
 ```
+
+The scanner reports per-run summary statistics including peak return, stability (% of eval steps ≥ 70% of peak), and flags like `SPIKE_THEN_DROP` and `STD_FLOOR_STUCK`.
 
 ---
 
-## Diagnosing problems
+## Evaluating Checkpoints
 
-### Root cause lookup
-
-| Flag in report | Root cause | Fix |
-|---|---|---|
-| `SPIKE_THEN_DROP` | Old `entropy_coef=1e-2` (100x too high) | Verify `entropy_coef=3e-4` in SHARED_TRAINING_OVERRIDES |
-| `ACTOR_GRAD_TINY` | `return_scale` at cap (100) | Check `symlog_clamp=5.0`, `return_scale_max=100` |
-| `POLICY_FROZEN` | Actor not getting signal | Check `actor_start_step=8000`, check WM health |
-| `POSTERIOR_COLLAPSE` | `kl_loss ≈ 0` | Check `free_nats`, check KL implementation |
-| `WM_NOT_LEARNING` | `obs_loss` not decreasing | Try `wm.lr: 3e-4→1e-4`; check replay is populated |
-| `HORIZON_STUCK` + H=20:100% | Uncertainty < thresh\_mid at all times | Check `actor_start_step=8000` so actor trains during high-unc phase |
-
-### TensorBoard key tags
-
-```
-loss/obs          WM observation head: start ~1.2, should reach <0.3 by 30k steps
-loss/kl           KL term: should rise above free_nats (1.0) quickly
-loss/reward       Reward head: should reach <0.05 by 30k steps
-policy/std_mean   Policy std: should decrease from 1.0 (proves actor is learning)
-value/return_scale  Return scale: should stay below 80; at 100 = actor_grad dead
-grad/actor_norm   Actor gradient: should be 0.02-0.15; <0.005 = nothing learning
-imagine/horizon_used  For adaptive: should show H=5 early, H=20 late
-```
-
----
-
-## Ablations (run after main experiments)
+After training, evaluate saved checkpoints over more episodes for reliable statistics:
 
 ```bash
-python scripts/run_experiments.py --group ablation_metric    --parallel 8 --gpus 8
-python scripts/run_experiments.py --group ablation_ensemble  --parallel 8 --gpus 8
-python scripts/run_experiments.py --group ablation_threshold --parallel 8 --gpus 8
+cd dreamer_impl
+
+# Evaluate best.pt in every run directory (30 episodes each)
+python scripts/eval_checkpoints.py --runs_dir runs --episodes 30
+
+# Evaluate only runs matching "hopper"
+python scripts/eval_checkpoints.py --runs_dir runs --filter hopper --checkpoint best --episodes 50
+
+# Prefer latest checkpoint
+python scripts/eval_checkpoints.py --runs_dir runs --checkpoint latest --episodes 20
+
+# Evaluate a single checkpoint directly
+python scripts/eval_checkpoints.py --checkpoint runs/hopper_h15_s0/checkpoints/best.pt --episodes 50
+
+# List found checkpoints without running
+python scripts/eval_checkpoints.py --runs_dir runs --list
 ```
+
+Results are written to `runs/eval_results_<checkpoint>_<N>eps_<timestamp>.txt` and a matching `.csv`.
+
+Checkpoint preference order: `best` → `latest` → `final` (falls back along the chain if a file is missing).
 
 ---
 
-## Key hyperparameters (as of 2026-04-13)
-
-| Parameter | Value | Why |
-|---|---|---|
-| `entropy_coef` | `3e-4` | DreamerV3 level; old 1e-2 caused SPIKE\_THEN\_DROP |
-| `actor_lr` | `3e-5` | DreamerV3 reference; prevents tanh saturation |
-| `critic_lr` | `3e-5` | Slower warmup prevents critic divergence |
-| `symlog_clamp` | `5.0` | symexp(5)=147, limits bootstrap to ~100 |
-| `return_scale_max` | `100.0` | Hard cap prevents actor\_grad going to zero |
-| `actor_start_step` | `8000` | Trains while WM still uncertain → adaptive switching |
-| `kl_beta` | `0.5` | Obs reconstruction gets more weight early |
-| Adaptive horizons | `[10, 15, 20]` | H=5 confirmed broken (positive actor\_loss); min raised to H=10 |
-| Hopper thresholds | `high=0.90, mid=0.55` | unc>0.90→H=10; unc>0.55→H=15; else→H=20 |
-| Walker2d thresholds | `high=1.50, mid=0.80` | unc>1.50→H=10; unc>0.80→H=15; else→H=20 |
-
-See `CHANGELOG.md` for full history of what changed and why.
-
----
-
-## Code structure
-
-```
-train.py                          entry point
-configs/config.yaml               base config (all defaults)
-CHANGELOG.md                      history of all HP changes with evidence
-
-thesiswm/
-  models/rssm.py                  RSSM + EnsembleWorldModel
-  agents/actor_critic.py          TanhGaussianPolicy + ValueNet
-  training/
-    trainer.py                    orchestrator: collection, eval, checkpointing
-    world_model_updater.py        WM loss + optimizer step
-    actor_critic_updater.py       imagination rollout + AC loss
-    imagination.py                lambda_returns(), decide_horizon()
-
-scripts/
-  run_experiments.py              launch experiment groups (parallel, multi-GPU)
-  scan_logs.py                    live status table (TB log scanner, cached)
-  analyze_runs.py                 full diagnostic report (WM health, AC health, diagnosis)
-  make_thesis_figures.py          training curves, horizon dist, LaTeX tables
-  visualize_runs.py               learning curve plots
-
-thesis/
-  thesis_skeleton.tex             LaTeX skeleton
-  figures/                        auto-generated by make_thesis_figures.py
-  tables/                         auto-generated LaTeX table fragments
-```
-
----
-
-## Install
+## Recording Videos
 
 ```bash
-pip install torch gymnasium[mujoco] hydra-core omegaconf tensorboard imageio[ffmpeg] tqdm
-export MUJOCO_GL=egl   # headless rendering on server
+cd dreamer_impl
+
+# Record 3 episodes per run (uses best.pt by default)
+python scripts/record_videos.py --runs_dir runs --episodes 3
+
+# Record from a specific checkpoint
+python scripts/record_videos.py --runs_dir runs --filter pendulum --checkpoint final --episodes 2
+
+# Write all videos to a shared directory
+python scripts/record_videos.py --runs_dir runs --out_dir videos/ --episodes 3
+
+# Change FPS
+python scripts/record_videos.py --runs_dir runs --fps 60
 ```
+
+Videos are saved as `<run_dir>/videos/<checkpoint_stem>/episode_000_return_123.4_len_200.mp4`.
+
+Requires `imageio` and `ffmpeg`:
+
+```bash
+pip install imageio imageio-ffmpeg
+```
+
+---
+
+## Configuration Reference
+
+The full config is in `configs/config.yaml`. Key sections:
+
+### Thesis features
+
+```yaml
+model:
+  ensemble_size: 1           # 1 = single WM baseline; 2+ = ensemble
+  ensemble_avg_rewards: false # average reward across WM members during imagination
+  imag_horizon: 15           # fixed horizon when adaptive.enabled=false
+
+adaptive:
+  enabled: false
+  horizons: [10, 15, 20]    # [H_low, H_mid, H_high]
+  thresh_high: 0.27          # ema_obs_loss > this → H_low
+  thresh_mid: 0.20           # ema_obs_loss > this → H_mid
+  ema_alpha: 0.003
+  ema_init: 2.0              # large → start at H_low until WM quality improves
+```
+
+Recommended thresholds per environment:
+
+| Environment | `thresh_high` | `thresh_mid` |
+|-------------|--------------|-------------|
+| Hopper-v4 | 0.27 | 0.20 |
+| Walker2d-v4 | 1.80 | 1.30 |
+| InvertedPendulum-v5 | 0.30 | 0.08 |
+
+### Training
+
+```yaml
+trainer:
+  steps: 500000
+  train_ratio: 512           # env steps per gradient update (controls update frequency)
+  eval_every: 10000
+  eval_episodes: 5
+  checkpoint_every: 10000    # save latest.pt every N env steps
+  save_best: true            # keep best.pt when eval return improves
+  save_periodic: false       # also save step_<N>.pt snapshots
+```
+
+### Checkpoints
+
+Checkpoints are saved under `runs/<exp_name>/checkpoints/`:
+
+| File | When saved |
+|------|-----------|
+| `best.pt` | When eval return improves |
+| `latest.pt` | After each eval and at checkpoint_every intervals |
+| `final.pt` | At the end of training |
+| `step_<N>.pt` | Periodically, if `save_periodic=true` |
+
+Each checkpoint contains:
+- `agent_state_dict` — full model weights
+- `optims_state_dict` — optimizer state (for resuming)
+- `step` — training step at save time
+- `updates` — gradient update count
+- `eval_return` — eval return at save time
+- `best_eval_return` — best seen so far
+- `cfg` — full resolved Hydra config
+
+### DreamerV3 hyperparameters
+
+```yaml
+horizon: 333        # discount horizon (γ = 1 - 1/333 ≈ 0.997)
+lamb: 0.95          # TD-λ mixing (0=1-step TD, 1=MC)
+act_entropy: 3e-4   # entropy regularization on actor
+kl_free: 1.0        # KL free-nats
+lr: 4e-5            # LaProp learning rate (shared for all components)
+agc: 0.3            # adaptive gradient clipping threshold
+warmup: 1000        # linear LR warmup steps
+```
+
+---
+
+## Directory Structure
+
+```
+dreamer_impl/
+├── train.py                  # Entry point
+├── configs/
+│   └── config.yaml           # All hyperparameters
+├── dreamer/
+│   ├── agent.py              # Dreamer agent (WorldModel, ensemble, actor-critic)
+│   ├── trainer.py            # Online training loop + checkpointing
+│   ├── envs.py               # MuJoCo environment wrapper
+│   ├── rssm.py               # RSSM (block-GRU + categorical latent)
+│   ├── networks.py           # Encoder, Decoder, MLPHead, ReturnEMA
+│   ├── buffer.py             # Replay buffer (TorchRL SliceSampler)
+│   ├── distributions.py      # Custom distributions (symexp_twohot, bounded_normal)
+│   ├── tools.py              # Logger, EMA, seeding utilities
+│   └── parallel.py           # Vectorised environment wrapper
+├── scripts/
+│   ├── run_experiments.py    # Experiment launcher with manifest tracking
+│   ├── scan_logs.py          # Fast TensorBoard log scanner
+│   ├── eval_checkpoints.py   # Post-hoc checkpoint evaluation
+│   ├── record_videos.py      # Video recording from checkpoints
+│   └── env_scan.py           # Environment discovery utility
+├── r2dreamer_src/            # Original r2dreamer source for reference
+└── experiments/
+    └── manifest.csv          # Auto-generated experiment status tracker
+```
+
+---
+
+## Differences from Original r2dreamer
+
+| Feature | r2dreamer | This repo |
+|---------|-----------|-----------|
+| Representation loss | InfoNCE / Barlow-Twins / DreamerPro | Standard decoder reconstruction |
+| World models | Single | Ensemble of N |
+| Imagination horizon | Fixed | Fixed or adaptive |
+| Environments | Atari, DMC, Crafter, MetaWorld | MuJoCo Gymnasium |
+| Checkpointing | Manual `torch.save` | Structured best/latest/final |
+| Evaluation | In-loop only | In-loop + standalone eval script |
+| Video recording | Not supported | `record_videos.py` |

@@ -1,147 +1,225 @@
-# Base config. Use --config <name> to load other experiment yaml files.
-
+# ── Run identity ──────────────────────────────────────────────────────────────
 exp_name: "default"
-
 seed: 0
-deterministic: true
-device: "cuda"   # set "cpu" if needed
-use_amp: true    # bfloat16 autocast on CUDA (same dynamic range as float32, ~1.5-2x faster matmuls)
+device: "cuda"
 
+# ── Environment ───────────────────────────────────────────────────────────────
 env:
-  id: "InvertedPendulum-v5"
-  num_envs: 4        # parallel collection envs (uses AsyncVectorEnv, each on its own CPU core)
+  id: "Hopper-v4"
+  num_envs: 8
+  eval_num_envs: 5
   action_repeat: 1
 
-replay:
-  capacity: 500000
-  seq_len: 16
-  batch_size: 512
+# ── Buffer ────────────────────────────────────────────────────────────────────
+buffer:
+  batch_size: 16
+  batch_length: 64
+  max_size: 1000000
+  device: ${device}
+  storage_device: "cpu"
 
-world_model:
-  ensemble_size: 2
-  obs_dim: null          # auto-filled from env at runtime
-  act_dim: null          # auto-filled
-  latent_dim: 64
-  deter_dim: 128         # 256 is image-scale; 128 is plenty for state-vector obs
-  hidden_dim: 256        # 512 is image-scale; 256 gives ~3x faster updates on state tasks
-  kl_beta: 0.5         # gentler KL penalty; obs reconstruction gets more relative weight
-  free_nats: 1.0       # total KL floor (not per-dim); applied as max(KL_sum, free_nats)
-  sigreg_weight: 0.01  # was 0.1; large values fight the posterior encoding information
-  # cont head: weight 0.5 prevents BCE from dominating obs/rew early; floor 0.9 ensures the
-  # imagination discount never collapses below 0.99*0.9=0.891/step even with a pessimistic WM.
-  cont_loss_weight: 0.5
-  cont_disc_floor: 0.9
-  lr: 3e-4
-  grad_clip: 100.0
-
-agent:
-  actor_hidden: 256
-  critic_hidden: 256
-  actor_lr: 3e-5    # low LR prevents rapid drift to saturation boundary
-  critic_lr: 3e-5   # matches DreamerV3; slower critic warmup prevents divergence driving SPIKE_THEN_DROP
-  entropy_coef: 3e-4  # DreamerV3 level; 1e-2 was 100x too high → entropy dominated actor loss early,
-                      # freezing policy at std=1.0 then causing sudden collapse when return gradient grew
-  pretanh_reg_coef: 1e-3  # penalises large |mean| pre-tanh directly; prevents vanishing gradients
-  discount: 0.99
-  lambda_: 0.95
-  # Symlog critic (DreamerV3 §A.2): train critic to predict symlog(V) instead of V directly.
-  # Bootstrap values are converted back via symexp before lambda-return computation.
-  # This breaks the V↑→target↑→V loop that blows up H=5/H=15: symlog(500)≈6.2 so the
-  # critic never needs to output large values even when returns are large.
-  symlog_critic: true
-  # Clamp symlog-space critic outputs before symexp conversion.
-  # symexp(5)=147: with H=20, γ=0.99, cont=0.99 the maximum bootstrap
-  # contribution is 0.82×0.82×147≈99, so target_actor ≤ ~130-150.
-  # symexp(7)=1096 (old): bootstrap≈737 → rscale→1000 → actor_grad≈0.001
-  # (ACTOR_GRAD_TINY death spiral). Reducing to 5.0 keeps rscale in [30,100]
-  # which is sufficient for the actor to learn. Once eval>1000 we can raise it.
-  symlog_clamp: 5.0
-  # Hard cap on the advantage normalisation scale.
-  # 1000 was too high — even with the p95-p5 fix, rscale can saturate at 1000
-  # when the critic reaches the symlog clamp. 100 forces gradients to stay sane.
-  return_scale_max: 100.0
-
-method:
-  name: "fixed_h20"  # fixed_h5 | fixed_h15 | fixed_h20 | adaptive_10_15_20
-  # ── Ensemble-disagreement uncertainty (original signal) ──────────────────────
-  # Measures latent_mean_l2 between the two WM ensemble members' next-latent predictions.
-  # Problem: settles to a stable per-seed value within ~500 WM updates → each run
-  # locks to exactly one horizon for the whole training run (no within-run switching).
-  uncertainty_metric: "latent_mean_l2"   # latent_mean_l2 | next_obs_mean_l2 | gaussian_kl
-  thresh_high: 0.90
-  thresh_mid: 0.55
-  # ── WM-loss uncertainty (dynamic signal) ─────────────────────────────────────
-  # Uses EMA of WM obs_loss as the horizon selector instead of ensemble disagreement.
-  # This signal varies throughout training: high early (WM still learning), low late
-  # (WM converged) → gives genuine within-run horizon switching.
-  # Enable with use_obs_loss_unc=true in adaptive experiment overrides.
-  use_obs_loss_unc: false
-  obs_loss_thresh_high: 0.30   # obs_loss above this → H=horizons[0] (short, cautious)
-  obs_loss_thresh_mid:  0.18   # obs_loss above this → H=horizons[1] (mid)
-                               # obs_loss below this → H=horizons[2] (long, confident)
-
-imagination:
-  horizon_fixed: 20          # used for fixed baselines (e.g., fixed_h15)
-  horizons: [5, 10, 20]      # adaptive candidates
-  batch_horizon_decision: "per_batch"  # (kept simple) choose one horizon per training batch
-  rollout_batch: 512
-  gamma: 0.99
-  lambda_: 0.95
-
-training:
-  total_steps: 90000
-  steps_per_chunk: 30000
-  resume: false
-  start_learning: 2000
-  actor_start_step: 3000
-  collect_per_step: 4
-  update_every: 4
-  updates_per_step: 1
-  log_every_steps: 200
-  eval_every_steps: 2000
+# ── Trainer ───────────────────────────────────────────────────────────────────
+trainer:
+  steps: 500000
+  pretrain: 1
+  train_ratio: 512
+  eval_every: 10000
   eval_episodes: 5
-  checkpoint_every_steps: 5000
-  log_episode_every: 10
+  log_every: 5000
+  checkpoint_every: 10000       # save latest.pt every N env steps; 0 = eval-only
+  save_latest: true
+  save_best: true
+  best_min_delta: 0.0           # improvement needed before replacing best.pt
+  save_periodic: false          # also keep step_<N>.pt snapshots
+  action_repeat: ${env.action_repeat}
+  batch_size: ${buffer.batch_size}
+  batch_length: ${buffer.batch_length}
 
-  # Checkpoint policy
-  save_periodic_checkpoints: false  # named step_N.pt snapshots (disabled = saves disk)
-  save_latest_every_steps: 10000   # overwrite latest.pt in-place for crash recovery (no new files)
-
-  # Eval episode cap — prevents eval from taking 10-20x longer as the agent improves
-  eval_max_episode_steps: 1000
-
-  # Best checkpoint tracking
-  best_min_delta: 1.0
-  save_best_train: true
-  train_best_min_delta: 1.0
-
-  # Eval-based rollback (checked every eval_every_steps)
-  rollback_drop: 25.0
-  rollback_patience: 4
-  min_steps_before_rollback: 400
-  rollback_lr_scale: 0.9
-  rollback_noise_scale: 0.01
-  rollback_cooldown_steps: 30000  # min steps between rollbacks; prevents re-triggering loops
-  wm_freeze_after_rollback: 0    # steps to freeze WM updates after rollback (0=disabled)
-
-  # Training-based early rollback (checked every episode)
-  train_rollback_check: true
-  train_rollback_drop: 20.0
-  train_rollback_patience: 3
-
-eval:
-  checkpoint_path: ""
-  episodes: 5
-  record_video: false
-  video_dir: "runs/default/videos"
-  video_fps: 30
-
+# ── Paths ─────────────────────────────────────────────────────────────────────
 paths:
   runs_dir: "runs"
-  ckpt_dirname: "checkpoints"
-  tb_dirname: "tb"
-  videos_dirname: "videos"
+  tb_subdir: "tb"
+  ckpt_subdir: "checkpoints"
 
+# ── Thesis features ───────────────────────────────────────────────────────────
+model:
+  ensemble_size: 1            # 1=baseline, 2=thesis ensemble
+  ensemble_avg_rewards: false  # average reward across WMs during imagination
+  imag_horizon: 15            # fixed horizon when adaptive.enabled=false
+
+adaptive:
+  enabled: false
+  horizons: [10, 15, 20]     # [H_low, H_mid, H_high]
+  thresh_high: 0.27           # ema_obs_loss > this → H_low  (calibrated for Hopper)
+  thresh_mid: 0.20            # ema_obs_loss > this → H_mid
+  ema_alpha: 0.003
+  ema_init: 2.0               # high → always start at H_low until WM quality improves
+
+# ── DreamerV3 core hyperparameters ────────────────────────────────────────────
+act_entropy: 3e-4
+kl_free: 1.0
+horizon: 333                  # discount horizon (γ = 1 - 1/horizon ≈ 0.997)
+lamb: 0.95                    # TD-λ mixing coefficient
+compile: false                # set true on Linux for torch.compile speedup
+log_grads: false
+
+lr: 4e-5
+agc: 0.3
+pmin: 1e-3
+eps: 1e-20
+beta1: 0.9
+beta2: 0.999
+warmup: 1000
+slow_target_update: 1
+slow_target_fraction: 0.02
+
+loss_scales:
+  recon: 1.0
+  rew: 1.0
+  con: 1.0
+  dyn: 1.0
+  rep: 0.1
+  policy: 1.0
+  value: 1.0
+  repval: 0.3
+
+# ── RSSM ──────────────────────────────────────────────────────────────────────
+rssm:
+  stoch: 32
+  deter: 512
+  hidden: 512
+  discrete: 32
+  img_layers: 2
+  obs_layers: 1
+  dyn_layers: 1
+  blocks: 8
+  act: "SiLU"
+  norm: true
+  unimix_ratio: 0.01
+  initial: "learned"
+  device: ${device}
+
+# ── Encoder ───────────────────────────────────────────────────────────────────
+encoder:
+  mlp_keys: "obs"
+  cnn_keys: "^$"
+  mlp:
+    shape: null
+    layers: 3
+    units: 512
+    act: "SiLU"
+    norm: true
+    device: ${device}
+    outscale: null
+    symlog_inputs: true
+    name: "mlp_encoder"
+  cnn:
+    act: "SiLU"
+    norm: true
+    kernel_size: 5
+    minres: 4
+    depth: 16
+    mults: [2, 3, 4, 4]
+
+# ── Decoder ───────────────────────────────────────────────────────────────────
+decoder:
+  mlp_keys: "obs"
+  cnn_keys: "^$"
+  mlp_dist:
+    name: "symlog_mse"
+  cnn_dist:
+    name: "mse"
+  mlp:
+    shape: null
+    layers: 3
+    units: 512
+    act: "SiLU"
+    norm: true
+    dist:
+      name: "identity"
+    device: ${device}
+    outscale: 1.0
+    symlog_inputs: false
+    name: "mlp_decoder"
+  cnn:
+    depth: 16
+    units: 512
+    bspace: 8
+    mults: [2, 3, 4, 4]
+    act: "SiLU"
+    norm: true
+    kernel_size: 5
+    minres: 4
+    outscale: 1.0
+
+# ── Reward head ───────────────────────────────────────────────────────────────
+reward:
+  shape: [255]
+  layers: 1
+  units: 512
+  act: "SiLU"
+  norm: true
+  dist:
+    name: "symexp_twohot"
+    bin_num: 255
+  outscale: 0.0
+  device: ${device}
+  symlog_inputs: false
+  name: "reward"
+
+# ── Continue head ─────────────────────────────────────────────────────────────
+cont:
+  shape: [1]
+  layers: 1
+  units: 512
+  act: "SiLU"
+  norm: true
+  dist:
+    name: "binary"
+  outscale: 1.0
+  device: ${device}
+  symlog_inputs: false
+  name: "cont"
+
+# ── Actor ─────────────────────────────────────────────────────────────────────
+actor:
+  shape: null
+  layers: 3
+  units: 512
+  act: "SiLU"
+  norm: true
+  device: ${device}
+  dist:
+    cont:
+      name: "bounded_normal"
+      min_std: 0.1
+      max_std: 1.0
+    disc:
+      name: "onehot"
+      unimix_ratio: 0.01
+    multi_disc:
+      name: "multi_onehot"
+      unimix_ratio: 0.01
+  outscale: 0.01
+  symlog_inputs: false
+  name: "actor"
+
+# ── Critic ────────────────────────────────────────────────────────────────────
+critic:
+  shape: [255]
+  layers: 3
+  units: 512
+  act: "SiLU"
+  norm: true
+  device: ${device}
+  dist:
+    name: "symexp_twohot"
+    bin_num: 255
+  outscale: 0.0
+  symlog_inputs: false
+  name: "value"
+
+# ── Hydra ─────────────────────────────────────────────────────────────────────
 hydra:
   run:
     dir: ${paths.runs_dir}/${exp_name}

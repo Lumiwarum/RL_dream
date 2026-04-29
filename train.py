@@ -1,87 +1,59 @@
-import os
+"""Entry point — DreamerV3 thesis implementation."""
+import atexit
+import pathlib
 import sys
-from typing import List, Optional
+import warnings
 
 import hydra
-from omegaconf import DictConfig, OmegaConf
+import torch
 
-from thesiswm.training.trainer import Trainer
-from thesiswm.utils.seed import set_global_seeds
-
-
-def _preprocess_argv(argv: List[str]) -> List[str]:
-    """
-    Convert user-friendly CLI flags into Hydra overrides.
-
-    Supported:
-      --config <name>             -> loads configs/<name>.yaml (via Hydra config_name)
-      --total_steps <int>         -> training.total_steps=<int>
-      --steps_per_chunk <int>     -> training.steps_per_chunk=<int>
-      --resume                    -> training.resume=true
-      --no_resume                 -> training.resume=false
-    """
-    out: List[str] = []
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--total_steps":
-            out.append(f"training.total_steps={int(argv[i+1])}")
-            i += 2
-        elif a == "--steps_per_chunk":
-            out.append(f"training.steps_per_chunk={int(argv[i+1])}")
-            i += 2
-        elif a == "--resume":
-            out.append("training.resume=true")
-            i += 1
-        elif a == "--no_resume":
-            out.append("training.resume=false")
-            i += 1
-        elif a == "--config":
-            # handled outside by passing config_name to hydra.main wrapper
-            out.append(a)
-            out.append(argv[i+1])
-            i += 2
-        else:
-            out.append(a)
-            i += 1
-    return out
+warnings.filterwarnings("ignore")
+torch.set_float32_matmul_precision("high")
 
 
-def _extract_config_name(argv: List[str], default_name: str = "config") -> str:
-    if "--config" in argv:
-        idx = argv.index("--config")
-        if idx + 1 < len(argv):
-            return argv[idx + 1]
-    return default_name
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(config):
+    # Add dreamer_impl to path so imports work regardless of cwd
+    root = pathlib.Path(__file__).resolve().parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
+    from dreamer import tools
+    from dreamer.agent import Dreamer
+    from dreamer.buffer import Buffer
+    from dreamer.envs import make_envs
+    from dreamer.trainer import OnlineTrainer
 
-def main():
-    argv = _preprocess_argv(sys.argv[1:])
-    config_name = _extract_config_name(argv, default_name="config")
-    # remove the --config <name> pair from argv passed to Hydra
-    if "--config" in argv:
-        idx = argv.index("--config")
-        del argv[idx:idx+2]
-    sys.argv = [sys.argv[0]] + argv
+    tools.set_seed_everywhere(int(config.seed))
 
-    # Use a fixed hydra run dir: runs/<exp_name> (so chunked runs keep writing to same folder)
-    # The config file also sets hydra.run.dir, but we enforce a safe default here.
-    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
+    logdir = pathlib.Path(config.paths.runs_dir) / config.exp_name
+    logdir.mkdir(parents=True, exist_ok=True)
 
-    _hydra_entrypoint(config_name=config_name)
+    console_f = tools.setup_console_log(logdir, filename="console.log")
+    atexit.register(lambda: console_f.close())
 
+    tb_dir = logdir / config.paths.tb_subdir
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    logger = tools.Logger(tb_dir)
+    logger.log_hydra_config(config)
 
-def _hydra_entrypoint(config_name: str):
-    @hydra.main(version_base=None, config_path="configs", config_name=config_name)
-    def _run(cfg: DictConfig) -> None:
-        # Ensure float32 obs/action as required
-        set_global_seeds(int(cfg.seed), deterministic=bool(cfg.deterministic))
+    print(f"Logdir: {logdir}")
+    print(f"Env: {config.env.id}  |  Ensemble: {config.model.ensemble_size}  |  Adaptive: {config.adaptive.enabled}")
 
-        trainer = Trainer(cfg)
-        print()
-        trainer.run()
+    train_envs, eval_envs, obs_space, act_space = make_envs(config)
 
-    _run()
+    replay = Buffer(config.buffer)
+
+    agent = Dreamer(config, obs_space, act_space).to(config.device)
+
+    trainer = OnlineTrainer(
+        config.trainer, replay, logger, logdir, train_envs, eval_envs, full_config=config
+    )
+    trainer.begin(agent)
+
+    # Save final checkpoint
+    trainer.save_checkpoint(agent, trainer.steps, "final")
+    print("Saved final checkpoint.")
 
 
 if __name__ == "__main__":
